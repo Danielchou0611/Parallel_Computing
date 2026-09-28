@@ -8,20 +8,21 @@
 #include <omp.h>
 #include <sched.h>
 #include <cstdint>
+#include <cstring>
 
 // ---------- adaptive filtering ----------
 
-struct RGB {
-    int r, g, b;
+struct SAT_RGB {
+    uint32_t r, g, b;
 };
 
-inline double calculateLuminance(const RGB& pixel) {
-    return 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b;
+inline double calculateLuminance(uint8_t r, uint8_t g, uint8_t b) {
+    return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
 void adaptiveFilterRGB(
-    const std::vector<std::vector<RGB>>& inputImage,
-    std::vector<std::vector<RGB>>& outputImage,
+    const uint8_t* in_data,
+    uint8_t* out_data,
     int height, 
     int width
 ) {
@@ -29,56 +30,53 @@ void adaptiveFilterRGB(
     int padW = width + 10;
     int satH = padH + 1;
     int satW = padW + 1;
+    size_t sat_sz = (size_t)satH * satW;
 
-    // SAT buffers for R, G, B
-    std::vector<uint32_t> satR(satH * satW, 0);
-    std::vector<uint32_t> satG(satH * satW, 0);
-    std::vector<uint32_t> satB(satH * satW, 0);
+    SAT_RGB* sat = (SAT_RGB*)malloc(sat_sz * sizeof(SAT_RGB));
+    std::memset(sat, 0, satW * sizeof(SAT_RGB));
 
     // Step 1: Compute row prefix sums
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < padH; r++) {
         int orig_r = std::min(std::max(r - 5, 0), height - 1);
-        const auto& row = inputImage[orig_r];
+        const uint8_t* row = in_data + (size_t)orig_r * width * 3;
 
         uint32_t r_sum = 0, g_sum = 0, b_sum = 0;
         int row_offset = (r + 1) * satW;
+        sat[row_offset] = {0, 0, 0};
 
         for (int c = 0; c < padW; c++) {
             int orig_c = std::min(std::max(c - 5, 0), width - 1);
-            const RGB& p = row[orig_c];
-            r_sum += p.r;
-            g_sum += p.g;
-            b_sum += p.b;
-            satR[row_offset + (c + 1)] = r_sum;
-            satG[row_offset + (c + 1)] = g_sum;
-            satB[row_offset + (c + 1)] = b_sum;
+            const uint8_t* p = row + orig_c * 3;
+            r_sum += p[0];
+            g_sum += p[1];
+            b_sum += p[2];
+            sat[row_offset + (c + 1)] = {r_sum, g_sum, b_sum};
         }
     }
 
-    // Step 2: Compute column prefix sums (accumulate vertically)
+    // Step 2: Compute column prefix sums
     #pragma omp parallel for schedule(static)
     for (int c = 1; c <= padW; c++) {
         uint32_t r_col = 0, g_col = 0, b_col = 0;
         for (int r = 1; r <= padH; r++) {
             int idx = r * satW + c;
-            r_col += satR[idx];
-            g_col += satG[idx];
-            b_col += satB[idx];
-            satR[idx] = r_col;
-            satG[idx] = g_col;
-            satB[idx] = b_col;
+            r_col += sat[idx].r;
+            g_col += sat[idx].g;
+            b_col += sat[idx].b;
+            sat[idx] = {r_col, g_col, b_col};
         }
     }
 
     // Step 3: Query SAT for each pixel in parallel (O(1) box sum per pixel)
     #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
-        const auto& in_row = inputImage[x];
-        auto& out_row = outputImage[x];
+        const uint8_t* in_row = in_data + (size_t)x * width * 3;
+        uint8_t* out_row = out_data + (size_t)x * width * 3;
+
         for (int y = 0; y < width; y++) {
-            const RGB& cur = in_row[y];
-            double brightness = calculateLuminance(cur);
+            const uint8_t* cur = in_row + y * 3;
+            double brightness = calculateLuminance(cur[0], cur[1], cur[2]);
             int radius = (brightness > 128) ? 5 : 2;
             int count = (2 * radius + 1) * (2 * radius + 1);
 
@@ -87,25 +85,23 @@ void adaptiveFilterRGB(
             int c1 = y + 5 - radius;
             int c2 = y + 6 + radius;
 
-            int idx22 = r2 * satW + c2;
-            int idx12 = r1 * satW + c2;
-            int idx21 = r2 * satW + c1;
-            int idx11 = r1 * satW + c1;
+            const SAT_RGB& s22 = sat[r2 * satW + c2];
+            const SAT_RGB& s12 = sat[r1 * satW + c2];
+            const SAT_RGB& s21 = sat[r2 * satW + c1];
+            const SAT_RGB& s11 = sat[r1 * satW + c1];
 
-            uint32_t sumR = satR[idx22] - satR[idx12] - satR[idx21] + satR[idx11];
-            uint32_t sumG = satG[idx22] - satG[idx12] - satG[idx21] + satG[idx11];
-            uint32_t sumB = satB[idx22] - satB[idx12] - satB[idx21] + satB[idx11];
-
-            out_row[y].r = sumR / count;
-            out_row[y].g = sumG / count;
-            out_row[y].b = sumB / count;
+            out_row[y * 3 + 0] = (s22.r - s12.r - s21.r + s11.r) / count;
+            out_row[y * 3 + 1] = (s22.g - s12.g - s21.g + s11.g) / count;
+            out_row[y * 3 + 2] = (s22.b - s12.b - s21.b + s11.b) / count;
         }
     }
+
+    free(sat);
 }
 
 // ---------- shared PNG I/O ----------
 
-void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
+uint8_t* read_png_file(char* file_name, int& width, int& height) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -137,8 +133,8 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     png_init_io(png, fp);
     png_read_info(png, info);
 
-    int width = png_get_image_width(png, info);
-    int height = png_get_image_height(png, info);
+    width = png_get_image_width(png, info);
+    height = png_get_image_height(png, info);
     png_byte color_type = png_get_color_type(png, info);
     png_byte bit_depth = png_get_bit_depth(png, info);
 
@@ -154,10 +150,8 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     if(png_get_valid(png, info, PNG_INFO_tRNS))
         png_set_tRNS_to_alpha(png);
 
-    if(color_type == PNG_COLOR_TYPE_RGB ||
-       color_type == PNG_COLOR_TYPE_GRAY ||
-       color_type == PNG_COLOR_TYPE_PALETTE)
-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    if(color_type & PNG_COLOR_MASK_ALPHA)
+        png_set_strip_alpha(png);
 
     if(color_type == PNG_COLOR_TYPE_GRAY ||
        color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
@@ -165,38 +159,22 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
 
     png_read_update_info(png, info);
 
-    size_t row_bytes = png_get_rowbytes(png, info);
+    size_t row_bytes = (size_t)width * 3;
+    uint8_t* raw_data = (uint8_t*)malloc(row_bytes * height);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    png_byte* raw_data = (png_byte*)malloc(row_bytes * height);
     for(int y = 0; y < height; y++) {
         row_pointers[y] = raw_data + y * row_bytes;
     }
 
     png_read_image(png, row_pointers);
     fclose(fp);
-
-    image.resize(height, std::vector<RGB>(width));
-    #pragma omp parallel for schedule(static)
-    for (int y = 0; y < height; y++) {
-        png_bytep row = row_pointers[y];
-        auto& img_row = image[y];
-        for (int x = 0; x < width; x++) {
-            png_bytep px = &(row[x * 4]);
-            img_row[x].r = px[0];
-            img_row[x].g = px[1];
-            img_row[x].b = px[2];
-        }
-    }
-    free(raw_data);
     free(row_pointers);
-
     png_destroy_read_struct(&png, &info, nullptr);
+
+    return raw_data;
 }
 
-void write_png_file(char* file_name, const std::vector<std::vector<RGB>>& image) {
-    int width = image[0].size();
-    int height = image.size();
-
+void write_png_file(char* file_name, const uint8_t* image_data, int width, int height) {
     FILE *fp = fopen(file_name, "wb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -241,27 +219,16 @@ void write_png_file(char* file_name, const std::vector<std::vector<RGB>>& image)
     png_set_filter(png, 0, PNG_FILTER_NONE);
     png_write_info(png, info);
 
-    size_t row_bytes = png_get_rowbytes(png, info);
+    size_t row_bytes = (size_t)width * 3;
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    png_byte* raw_data = (png_byte*)malloc(row_bytes * height);
-    #pragma omp parallel for schedule(static)
-    for (int y = 0; y < height; y++) {
-        row_pointers[y] = raw_data + y * row_bytes;
-        png_bytep row = row_pointers[y];
-        const auto& img_row = image[y];
-        for (int x = 0; x < width; x++) {
-            row[x * 3] = img_row[x].r;
-            row[x * 3 + 1] = img_row[x].g;
-            row[x * 3 + 2] = img_row[x].b;
-        }
+    for(int y = 0; y < height; y++) {
+        row_pointers[y] = (png_bytep)(image_data + y * row_bytes);
     }
 
     png_write_image(png, row_pointers);
     png_write_end(png, nullptr);
 
-    free(raw_data);
     free(row_pointers);
-
     png_destroy_write_struct(&png, &info);
     fclose(fp);
 }
@@ -282,17 +249,16 @@ int main(int argc, char** argv) {
     char* input_file = argv[1];
     char* output_file = argv[2];
 
-    std::vector<std::vector<RGB>> inputImage;
-    read_png_file(input_file, inputImage);
+    int width = 0, height = 0;
+    uint8_t* in_data = read_png_file(input_file, width, height);
+    uint8_t* out_data = (uint8_t*)malloc((size_t)width * height * 3);
 
-    int height = inputImage.size();
-    int width = inputImage[0].size();
+    adaptiveFilterRGB(in_data, out_data, height, width);
 
-    std::vector<std::vector<RGB>> outputImage(height, std::vector<RGB>(width));
+    write_png_file(output_file, out_data, width, height);
 
-    adaptiveFilterRGB(inputImage, outputImage, height, width);
-
-    write_png_file(output_file, outputImage);
+    free(in_data);
+    free(out_data);
 
     return 0;
 }
