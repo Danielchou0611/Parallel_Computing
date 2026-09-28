@@ -7,7 +7,7 @@
 #include <chrono>
 #include <omp.h>
 #include <sched.h>
-// #include <pthread.h>
+#include <cstdint>
 
 // ---------- adaptive filtering ----------
 
@@ -15,13 +15,8 @@ struct RGB {
     int r, g, b;
 };
 
-double calculateLuminance(const RGB& pixel) {
+inline double calculateLuminance(const RGB& pixel) {
     return 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b;
-}
-
-
-int determineKernelSize(double brightness) {
-    return brightness > 128 ? 11 : 5;
 }
 
 void adaptiveFilterRGB(
@@ -30,30 +25,80 @@ void adaptiveFilterRGB(
     int height, 
     int width
 ) {
-    #pragma omp parallel for schedule(guided)
+    int padH = height + 10;
+    int padW = width + 10;
+    int satH = padH + 1;
+    int satW = padW + 1;
+
+    // SAT buffers for R, G, B
+    std::vector<uint32_t> satR(satH * satW, 0);
+    std::vector<uint32_t> satG(satH * satW, 0);
+    std::vector<uint32_t> satB(satH * satW, 0);
+
+    // Step 1: Compute row prefix sums
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < padH; r++) {
+        int orig_r = std::min(std::max(r - 5, 0), height - 1);
+        const auto& row = inputImage[orig_r];
+
+        uint32_t r_sum = 0, g_sum = 0, b_sum = 0;
+        int row_offset = (r + 1) * satW;
+
+        for (int c = 0; c < padW; c++) {
+            int orig_c = std::min(std::max(c - 5, 0), width - 1);
+            const RGB& p = row[orig_c];
+            r_sum += p.r;
+            g_sum += p.g;
+            b_sum += p.b;
+            satR[row_offset + (c + 1)] = r_sum;
+            satG[row_offset + (c + 1)] = g_sum;
+            satB[row_offset + (c + 1)] = b_sum;
+        }
+    }
+
+    // Step 2: Compute column prefix sums (accumulate vertically)
+    #pragma omp parallel for schedule(static)
+    for (int c = 1; c <= padW; c++) {
+        uint32_t r_col = 0, g_col = 0, b_col = 0;
+        for (int r = 1; r <= padH; r++) {
+            int idx = r * satW + c;
+            r_col += satR[idx];
+            g_col += satG[idx];
+            b_col += satB[idx];
+            satR[idx] = r_col;
+            satG[idx] = g_col;
+            satB[idx] = b_col;
+        }
+    }
+
+    // Step 3: Query SAT for each pixel in parallel (O(1) box sum per pixel)
+    #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
+        const auto& in_row = inputImage[x];
+        auto& out_row = outputImage[x];
         for (int y = 0; y < width; y++) {
-            const RGB& cur = inputImage[x][y];
+            const RGB& cur = in_row[y];
             double brightness = calculateLuminance(cur);
             int radius = (brightness > 128) ? 5 : 2;
             int count = (2 * radius + 1) * (2 * radius + 1);
 
-            int sumR = 0, sumG = 0, sumB = 0;
-            for (int i = -radius; i <= radius; i++) {
-                int px = std::min(std::max(x + i, 0), height - 1);
-                const auto& row = inputImage[px];
-                for (int j = -radius; j <= radius; j++) {
-                    int py = std::min(std::max(y + j, 0), width - 1);
-                    const RGB& p = row[py];
-                    sumR += p.r;
-                    sumG += p.g;
-                    sumB += p.b;
-                }
-            }
+            int r1 = x + 5 - radius;
+            int r2 = x + 6 + radius;
+            int c1 = y + 5 - radius;
+            int c2 = y + 6 + radius;
 
-            outputImage[x][y].r = sumR / count;
-            outputImage[x][y].g = sumG / count;
-            outputImage[x][y].b = sumB / count;
+            int idx22 = r2 * satW + c2;
+            int idx12 = r1 * satW + c2;
+            int idx21 = r2 * satW + c1;
+            int idx11 = r1 * satW + c1;
+
+            uint32_t sumR = satR[idx22] - satR[idx12] - satR[idx21] + satR[idx11];
+            uint32_t sumG = satG[idx22] - satG[idx12] - satG[idx21] + satG[idx11];
+            uint32_t sumB = satB[idx22] - satB[idx12] - satB[idx21] + satB[idx11];
+
+            out_row[y].r = sumR / count;
+            out_row[y].g = sumG / count;
+            out_row[y].b = sumB / count;
         }
     }
 }
@@ -120,32 +165,35 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
 
     png_read_update_info(png, info);
 
+    size_t row_bytes = png_get_rowbytes(png, info);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    png_byte* raw_data = (png_byte*)malloc(row_bytes * height);
     for(int y = 0; y < height; y++) {
-        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png,info));
+        row_pointers[y] = raw_data + y * row_bytes;
     }
 
     png_read_image(png, row_pointers);
-
     fclose(fp);
 
     image.resize(height, std::vector<RGB>(width));
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         png_bytep row = row_pointers[y];
+        auto& img_row = image[y];
         for (int x = 0; x < width; x++) {
             png_bytep px = &(row[x * 4]);
-            image[y][x].r = px[0];
-            image[y][x].g = px[1];
-            image[y][x].b = px[2];
+            img_row[x].r = px[0];
+            img_row[x].g = px[1];
+            img_row[x].b = px[2];
         }
-        free(row_pointers[y]);
     }
+    free(raw_data);
     free(row_pointers);
 
     png_destroy_read_struct(&png, &info, nullptr);
 }
 
-void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
+void write_png_file(char* file_name, const std::vector<std::vector<RGB>>& image) {
     int width = image[0].size();
     int height = image.size();
 
@@ -189,24 +237,29 @@ void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
         PNG_COMPRESSION_TYPE_DEFAULT,
         PNG_FILTER_TYPE_DEFAULT
     );
+    png_set_compression_level(png, 0);
+    png_set_filter(png, 0, PNG_FILTER_NONE);
     png_write_info(png, info);
 
+    size_t row_bytes = png_get_rowbytes(png, info);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    png_byte* raw_data = (png_byte*)malloc(row_bytes * height);
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png,info));
+        row_pointers[y] = raw_data + y * row_bytes;
+        png_bytep row = row_pointers[y];
+        const auto& img_row = image[y];
         for (int x = 0; x < width; x++) {
-            row_pointers[y][x * 3] = image[y][x].r;
-            row_pointers[y][x * 3 + 1] = image[y][x].g;
-            row_pointers[y][x * 3 + 2] = image[y][x].b;
+            row[x * 3] = img_row[x].r;
+            row[x * 3 + 1] = img_row[x].g;
+            row[x * 3 + 2] = img_row[x].b;
         }
     }
 
     png_write_image(png, row_pointers);
     png_write_end(png, nullptr);
 
-    for (int y = 0; y < height; y++) {
-        free(row_pointers[y]);
-    }
+    free(raw_data);
     free(row_pointers);
 
     png_destroy_write_struct(&png, &info);
@@ -221,14 +274,10 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // --- 新增這段 CPU 核心偵測與 OpenMP 設定 ---
     cpu_set_t cpuset;
     sched_getaffinity(0, sizeof(cpuset), &cpuset);
     int ncpus = CPU_COUNT(&cpuset);
     omp_set_num_threads(ncpus);
-    // -------------------------------------------
-
-    // auto start_all = std::chrono::high_resolution_clock::now();
 
     char* input_file = argv[1];
     char* output_file = argv[2];
@@ -241,21 +290,9 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<RGB>> outputImage(height, std::vector<RGB>(width));
 
-    // auto start = std::chrono::high_resolution_clock::now();
-
     adaptiveFilterRGB(inputImage, outputImage, height, width);
-    // adaptiveFilterRGB_parallel(inputImage, outputImage, height, width);
-
-    // auto end = std::chrono::high_resolution_clock::now();
-
-    // std::chrono::duration<double> elapsed_seconds = end - start;
-    // std::cout << "Main Program Time: " << elapsed_seconds.count() * 1000.0 << " ms" << std::endl;
 
     write_png_file(output_file, outputImage);
-
-    // auto end_all = std::chrono::high_resolution_clock::now();
-    // elapsed_seconds = end_all - start_all;
-    // std::cout << "Total Program Time: " << elapsed_seconds.count() * 1000.0 << " ms" << std::endl;
 
     return 0;
 }
