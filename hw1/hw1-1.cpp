@@ -14,124 +14,108 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// ---------- adaptive filtering ----------
+// ---------- adaptive sliding window filtering ----------
 
-struct SAT_RGB {
+struct RGB {
     uint32_t r, g, b;
 };
 
-void adaptiveFilterRGB(
+void sliding_box_filter(
     const uint8_t* in_data,
     uint8_t* out_data,
-    int height, 
+    int height,
     int width,
     int channels
 ) {
-    int padH = height + 10;
-    int padW = width + 10;
-    int satH = padH + 1;
-    int satW = padW + 1;
-    size_t sat_sz = (size_t)satH * satW;
+    auto get_pixel = [&](int r, int c) -> const uint8_t* {
+        r = std::min(std::max(r, 0), height - 1);
+        c = std::min(std::max(c, 0), width - 1);
+        return in_data + ((size_t)r * width + c) * channels;
+    };
 
-    SAT_RGB* sat = (SAT_RGB*)malloc(sat_sz * sizeof(SAT_RGB));
-    std::memset(sat, 0, satW * sizeof(SAT_RGB));
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+        int r_start = tid * height / nthreads;
+        int r_end = (tid + 1) * height / nthreads;
 
-    // Step 1: Compute row prefix sums with border peeling
-    #pragma omp parallel for schedule(static)
-    for (int r = 0; r < padH; r++) {
-        int orig_r = std::min(std::max(r - 5, 0), height - 1);
-        const uint8_t* row = in_data + (size_t)orig_r * width * channels;
+        int pad_w = width + 12;
+        std::vector<RGB> col11(pad_w, {0, 0, 0});
+        std::vector<RGB> col5(pad_w, {0, 0, 0});
 
-        uint32_t r_sum = 0, g_sum = 0, b_sum = 0;
-        int row_offset = (r + 1) * satW;
-        sat[row_offset] = {0, 0, 0};
-
-        // Left border (c = 0 .. 4) -> clamped to orig_c = 0
-        const uint8_t* left_p = row;
-        for (int c = 0; c < 5; c++) {
-            r_sum += left_p[0];
-            g_sum += left_p[1];
-            b_sum += left_p[2];
-            sat[row_offset + (c + 1)] = {r_sum, g_sum, b_sum};
+        for (int c = -5; c <= width + 5; c++) {
+            int idx = c + 5;
+            uint32_t r11 = 0, g11 = 0, b11 = 0;
+            uint32_t r5 = 0, g5 = 0, b5 = 0;
+            for (int dr = -5; dr <= 5; dr++) {
+                const uint8_t* p = get_pixel(r_start + dr, c);
+                r11 += p[0]; g11 += p[1]; b11 += p[2];
+                if (dr >= -2 && dr <= 2) {
+                    r5 += p[0]; g5 += p[1]; b5 += p[2];
+                }
+            }
+            col11[idx] = {r11, g11, b11};
+            col5[idx] = {r5, g5, b5};
         }
 
-        // Center region (orig_c = 0 .. width - 1)
-        const uint8_t* p = row;
-        for (int orig_c = 0; orig_c < width; orig_c++) {
-            r_sum += p[0];
-            g_sum += p[1];
-            b_sum += p[2];
-            p += channels;
-            sat[row_offset + (orig_c + 6)] = {r_sum, g_sum, b_sum};
-        }
+        for (int r = r_start; r < r_end; r++) {
+            if (r > r_start) {
+                for (int c = -5; c <= width + 5; c++) {
+                    int idx = c + 5;
+                    const uint8_t* add11 = get_pixel(r + 5, c);
+                    const uint8_t* sub11 = get_pixel(r - 6, c);
+                    col11[idx].r += add11[0] - sub11[0];
+                    col11[idx].g += add11[1] - sub11[1];
+                    col11[idx].b += add11[2] - sub11[2];
 
-        // Right border (c = width + 5 .. width + 9) -> clamped to orig_c = width - 1
-        const uint8_t* right_p = row + (size_t)(width - 1) * channels;
-        for (int c = width + 5; c < padW; c++) {
-            r_sum += right_p[0];
-            g_sum += right_p[1];
-            b_sum += right_p[2];
-            sat[row_offset + (c + 1)] = {r_sum, g_sum, b_sum};
-        }
-    }
+                    const uint8_t* add5 = get_pixel(r + 2, c);
+                    const uint8_t* sub5 = get_pixel(r - 3, c);
+                    col5[idx].r += add5[0] - sub5[0];
+                    col5[idx].g += add5[1] - sub5[1];
+                    col5[idx].b += add5[2] - sub5[2];
+                }
+            }
 
-    // Step 2: Compute column prefix sums with cache blocking (B = 256)
-    const int B = 256;
-    #pragma omp parallel for schedule(static)
-    for (int cb = 1; cb <= padW; cb += B) {
-        int c_end = std::min(cb + B, padW + 1);
-        uint32_t col_r[256], col_g[256], col_b[256];
-        std::memset(col_r, 0, (c_end - cb) * sizeof(uint32_t));
-        std::memset(col_g, 0, (c_end - cb) * sizeof(uint32_t));
-        std::memset(col_b, 0, (c_end - cb) * sizeof(uint32_t));
+            RGB box11 = {0, 0, 0};
+            RGB box5 = {0, 0, 0};
+            for (int dy = -5; dy <= 5; dy++) {
+                int idx = dy + 5;
+                box11.r += col11[idx].r; box11.g += col11[idx].g; box11.b += col11[idx].b;
+                if (dy >= -2 && dy <= 2) {
+                    box5.r += col5[idx].r; box5.g += col5[idx].g; box5.b += col5[idx].b;
+                }
+            }
 
-        for (int r = 1; r <= padH; r++) {
-            SAT_RGB* row_ptr = &sat[r * satW];
-            #pragma GCC unroll 8
-            for (int c = cb; c < c_end; c++) {
-                int local_c = c - cb;
-                col_r[local_c] += row_ptr[c].r;
-                col_g[local_c] += row_ptr[c].g;
-                col_b[local_c] += row_ptr[c].b;
-                row_ptr[c] = {col_r[local_c], col_g[local_c], col_b[local_c]};
+            const uint8_t* in_row = in_data + (size_t)r * width * channels;
+            uint8_t* out_row = out_data + (size_t)r * width * 3;
+
+            for (int y = 0; y < width; y++) {
+                if (y > 0) {
+                    int add11_idx = (y + 5) + 5;
+                    int sub11_idx = (y - 6) + 5;
+                    box11.r += col11[add11_idx].r - col11[sub11_idx].r;
+                    box11.g += col11[add11_idx].g - col11[sub11_idx].g;
+                    box11.b += col11[add11_idx].b - col11[sub11_idx].b;
+
+                    int add5_idx = (y + 2) + 5;
+                    int sub5_idx = (y - 3) + 5;
+                    box5.r += col5[add5_idx].r - col5[sub5_idx].r;
+                    box5.g += col5[add5_idx].g - col5[sub5_idx].g;
+                    box5.b += col5[add5_idx].b - col5[sub5_idx].b;
+                }
+
+                const uint8_t* cur = in_row + y * channels;
+                bool is_bright = (299u * cur[0] + 587u * cur[1] + 114u * cur[2]) > 128000u;
+                uint32_t mul = is_bright ? 4333u : 20972u;
+                const RGB& b = is_bright ? box11 : box5;
+
+                out_row[y * 3 + 0] = (b.r * mul) >> 19;
+                out_row[y * 3 + 1] = (b.g * mul) >> 19;
+                out_row[y * 3 + 2] = (b.b * mul) >> 19;
             }
         }
     }
-
-    // Step 3: Query SAT for each pixel in parallel (O(1) box sum per pixel with fast reciprocal division)
-    #pragma omp parallel for schedule(static)
-    for (int x = 0; x < height; x++) {
-        const uint8_t* in_row = in_data + (size_t)x * width * channels;
-        uint8_t* out_row = out_data + (size_t)x * width * 3;
-
-        const SAT_RGB* sat_r2_5 = sat + (size_t)(x + 11) * satW;
-        const SAT_RGB* sat_r1_5 = sat + (size_t)x * satW;
-        const SAT_RGB* sat_r2_2 = sat + (size_t)(x + 8) * satW;
-        const SAT_RGB* sat_r1_2 = sat + (size_t)(x + 3) * satW;
-
-        for (int y = 0; y < width; y++) {
-            const uint8_t* cur = in_row + y * channels;
-            // Exact integer luminance check: 299*r + 587*g + 114*b > 128000
-            bool is_bright = (299u * cur[0] + 587u * cur[1] + 114u * cur[2]) > 128000u;
-
-            const SAT_RGB* r2_ptr = is_bright ? sat_r2_5 : sat_r2_2;
-            const SAT_RGB* r1_ptr = is_bright ? sat_r1_5 : sat_r1_2;
-            int c1 = is_bright ? y : (y + 3);
-            int c2 = is_bright ? (y + 11) : (y + 8);
-            uint32_t mul = is_bright ? 4333u : 20972u; // >> 19 exact division by 121 or 25 without idiv
-
-            const SAT_RGB& s22 = r2_ptr[c2];
-            const SAT_RGB& s12 = r1_ptr[c2];
-            const SAT_RGB& s21 = r2_ptr[c1];
-            const SAT_RGB& s11 = r1_ptr[c1];
-
-            out_row[y * 3 + 0] = ((s22.r - s12.r - s21.r + s11.r) * mul) >> 19;
-            out_row[y * 3 + 1] = ((s22.g - s12.g - s21.g + s11.g) * mul) >> 19;
-            out_row[y * 3 + 2] = ((s22.b - s12.b - s21.b + s11.b) * mul) >> 19;
-        }
-    }
-
-    free(sat);
 }
 
 // ---------- shared PNG I/O (mmap accelerated) ----------
@@ -178,6 +162,9 @@ uint8_t* read_png_file(char* file_name, int& width, int& height, int& channels) 
         munmap((void*)mapped, file_size);
         exit(EXIT_FAILURE);
     }
+
+    // Skip redundant chunk CRC calculations during read
+    png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
 
     png_set_read_fn(png, &reader, mem_read_fn);
     png_read_info(png, info);
@@ -301,7 +288,7 @@ int main(int argc, char** argv) {
     uint8_t* in_data = read_png_file(input_file, width, height, channels);
     uint8_t* out_data = (uint8_t*)malloc((size_t)width * height * 3);
 
-    adaptiveFilterRGB(in_data, out_data, height, width, channels);
+    sliding_box_filter(in_data, out_data, height, width, channels);
 
     write_png_file(output_file, out_data, width, height);
 
