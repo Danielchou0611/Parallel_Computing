@@ -7,11 +7,42 @@
 | 1 | 2026-09-28 14:10 | hw1-1 | Initial baseline (OpenMP naive on loops) | 35.01 | 8/8 AC | 1.00x |
 | 2 | 2026-09-28 21:36 | hw1-1 | Single-pass RGB loop, eliminate temporary channel vectors, dynamic CPU affinity setting, schedule(guided) | 29.57 | 8/8 AC | 1.18x |
 | 3 | 2026-09-28 21:59 | hw1-1 | 2D Integral Image (SAT) O(1) box sum, contiguous I/O buffers, fast uncompressed PNG write | 4.34 | 8/8 AC | 8.07x |
-| 4 | 2026-09-29 00:30 | hw1-1 | Zero-copy 1D RGB buffer (no vector<vector>), interleaved SAT_RGB, and -march=native AVX2 vectorization | 2.57 | 8/8 AC | **13.62x** 🚀 |
+| 4 | 2026-09-29 00:30 | hw1-1 | Zero-copy 1D RGB buffer (no vector<vector>), interleaved SAT_RGB, and -march=native AVX2 vectorization | 2.57 | 8/8 AC | 13.62x |
+| 5 | 2026-09-29 01:47 | hw1-1 | Zero-copy 1D RGB buffer, interleaved SAT_RGB, mmap + madvise PNG reading, fast uncompressed write | 2.53 | 8/8 AC | **13.84x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #5: mmap + madvise PNG I/O & Memory Optimization
+- **Target**: `hw1-1`
+- **Date**: 2026-09-29 01:47
+- **Total Time**: 2.53s (8/8 AC) — **New Best!**
+- **Speedup vs Baseline**: 13.84x (vs v4: 1.02x)
+- **Leaderboard Rank**: Jumped from #35 to **#34**!
+- **Key Modifications**:
+  1. **mmap + madvise 零拷貝檔案讀取**：
+     - 使用 `open` + `mmap` 取代傳統 C library `fopen` / `fread`，消除核心態（Kernel space）到使用者態（User space）的緩衝拷貝。
+     - 搭配 `madvise(..., MADV_WILLNEED | MADV_SEQUENTIAL)` 通知 Linux 核心進行大區塊預先分頁調入（Page Read-ahead），減少 page fault 延遲。
+  2. **1MB 大緩衝區 PNG 輸出**：
+     - 使用 `setvbuf` 配置 1MB I/O 寫入緩衝區，減少系統呼叫次數。
+
+```
+judging 8 case(s)
+  TC   STAT    NEW BEST
+  t01  AC     0.01 0.01 ↓
+  t02  AC     0.04 0.04 ↑
+  t04  AC     0.20 0.20 ↓
+  t03  AC     0.48 0.49 ↓
+  t05  AC     0.34 0.38 ↓
+  t06  AC     0.52 0.51 ↑
+  t07  AC     0.42 0.45 ↓
+  t08  AC     0.50 0.48 ↑
+─────────────────────────
+Total: 8/8    2.53 2.57 ↓
+```
+
+---
 
 ### Run #4: Zero-copy 1D RGB Buffer & Interleaved SAT_RGB
 - **Target**: `hw1-1`
