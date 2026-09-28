@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <chrono>
+#include <omp.h>
+#include <sched.h>
 // #include <pthread.h>
 
 // ---------- adaptive filtering ----------
@@ -22,74 +24,36 @@ int determineKernelSize(double brightness) {
     return brightness > 128 ? 11 : 5;
 }
 
-void applyFilterToChannel(
-    const std::vector<std::vector<int>>& input, 
-    std::vector<std::vector<int>>& output, 
-    const std::vector<std::vector<int>>& kernelSizes, 
-    int height,
-    int width
-) {
-    for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            int kernelSize = kernelSizes[x][y];
-            int kernelRadius = kernelSize / 2;
-            double sum = 0.0;
-            double filteredPixel = 0.0;
-
-            for (int i = -kernelRadius; i <= kernelRadius; i++) {
-                for (int j = -kernelRadius; j <= kernelRadius; j++) {
-                    int pixelX = std::min(std::max(x + i, 0), height - 1);
-                    int pixelY = std::min(std::max(y + j, 0), width - 1);
-                    filteredPixel += input[pixelX][pixelY];
-                    sum += 1.0;
-                }
-            }
-
-            output[x][y] = static_cast<int>(filteredPixel / sum);
-        }
-    }
-}
-
 void adaptiveFilterRGB(
     const std::vector<std::vector<RGB>>& inputImage,
     std::vector<std::vector<RGB>>& outputImage,
     int height, 
     int width
 ) {
-    std::vector<std::vector<int>> redChannel(height, std::vector<int>(width));
-    std::vector<std::vector<int>> greenChannel(height, std::vector<int>(width));
-    std::vector<std::vector<int>> blueChannel(height, std::vector<int>(width));
-
+    #pragma omp parallel for schedule(guided)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
-            redChannel[x][y] = inputImage[x][y].r;
-            greenChannel[x][y] = inputImage[x][y].g;
-            blueChannel[x][y] = inputImage[x][y].b;
-        }
-    }
+            const RGB& cur = inputImage[x][y];
+            double brightness = calculateLuminance(cur);
+            int radius = (brightness > 128) ? 5 : 2;
+            int count = (2 * radius + 1) * (2 * radius + 1);
 
-    std::vector<std::vector<int>> kernelSizes(height, std::vector<int>(width));
+            int sumR = 0, sumG = 0, sumB = 0;
+            for (int i = -radius; i <= radius; i++) {
+                int px = std::min(std::max(x + i, 0), height - 1);
+                const auto& row = inputImage[px];
+                for (int j = -radius; j <= radius; j++) {
+                    int py = std::min(std::max(y + j, 0), width - 1);
+                    const RGB& p = row[py];
+                    sumR += p.r;
+                    sumG += p.g;
+                    sumB += p.b;
+                }
+            }
 
-    for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            double brightness = calculateLuminance(inputImage[x][y]);
-            kernelSizes[x][y] = determineKernelSize(brightness);
-        }
-    }
-
-    std::vector<std::vector<int>> tempRed(height, std::vector<int>(width));
-    std::vector<std::vector<int>> tempGreen(height, std::vector<int>(width));
-    std::vector<std::vector<int>> tempBlue(height, std::vector<int>(width));
-
-    applyFilterToChannel(redChannel, tempRed, kernelSizes, height, width);
-    applyFilterToChannel(greenChannel, tempGreen, kernelSizes, height, width);
-    applyFilterToChannel(blueChannel, tempBlue, kernelSizes, height, width);
-
-    for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            outputImage[x][y].r = tempRed[x][y];
-            outputImage[x][y].g = tempGreen[x][y];
-            outputImage[x][y].b = tempBlue[x][y];
+            outputImage[x][y].r = sumR / count;
+            outputImage[x][y].g = sumG / count;
+            outputImage[x][y].b = sumB / count;
         }
     }
 }
@@ -256,6 +220,13 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0] << " <inputfile.png> <outputfile.png>" << std::endl;
         return -1;
     }
+
+    // --- 新增這段 CPU 核心偵測與 OpenMP 設定 ---
+    cpu_set_t cpuset;
+    sched_getaffinity(0, sizeof(cpuset), &cpuset);
+    int ncpus = CPU_COUNT(&cpuset);
+    omp_set_num_threads(ncpus);
+    // -------------------------------------------
 
     // auto start_all = std::chrono::high_resolution_clock::now();
 

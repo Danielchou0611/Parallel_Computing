@@ -1,0 +1,13 @@
+# Binaries
+hw1/hw1-1
+hw1/hw1-2
+hw1/hw1-3
+hw1/hw1-1_*
+lab1/lab1
+
+# Temporary test outputs
+*.png
+!cases/**/*.png
+
+# Object files
+*.o
