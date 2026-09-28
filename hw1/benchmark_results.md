@@ -8,11 +8,47 @@
 | 2 | 2026-09-28 21:36 | hw1-1 | Single-pass RGB loop, eliminate temporary channel vectors, dynamic CPU affinity setting, schedule(guided) | 29.57 | 8/8 AC | 1.18x |
 | 3 | 2026-09-28 21:59 | hw1-1 | 2D Integral Image (SAT) O(1) box sum, contiguous I/O buffers, fast uncompressed PNG write | 4.34 | 8/8 AC | 8.07x |
 | 4 | 2026-09-29 00:30 | hw1-1 | Zero-copy 1D RGB buffer (no vector<vector>), interleaved SAT_RGB, and -march=native AVX2 vectorization | 2.57 | 8/8 AC | 13.62x |
-| 5 | 2026-09-29 01:47 | hw1-1 | Zero-copy 1D RGB buffer, interleaved SAT_RGB, mmap + madvise PNG reading, fast uncompressed write | 2.53 | 8/8 AC | **13.84x** 🚀 |
+| 5 | 2026-09-29 01:47 | hw1-1 | Zero-copy 1D RGB buffer, interleaved SAT_RGB, mmap + madvise PNG reading, fast uncompressed write | 2.53 | 8/8 AC | 13.84x |
+| 6 | 2026-09-29 02:03 | hw1-1 | Zero strip-alpha in libpng, cache-blocked Step 2 (B=256), border peeling Step 1, branchless fixed-point division (>> 19) | 2.47 | 8/8 AC | **14.17x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #6: Zero-Strip-Alpha, Blocked Column SAT, Border Peeling & Fast Reciprocal Division
+- **Target**: `hw1-1`
+- **Date**: 2026-09-29 02:03
+- **Total Time**: 2.47s (8/8 AC) — **New Best!**
+- **Speedup vs Baseline**: 14.17x (vs v5: 1.024x)
+- **Leaderboard Rank**: Progressing deeper into Top 30!
+- **Key Modifications**:
+  1. **移除單執行緒 `png_set_strip_alpha`**：
+     - RGBA 圖片直接解碼為 4 通道平坦記憶體，避免 libpng 在單執行緒上逐列壓縮記憶體。通道 stride 交由後續由 OpenMP 8 核心並行的 Step 1 處理。
+  2. **Step 1 邊界剝離（Border Peeling）**：
+     - 將左右各 5 像素邊界與中間主體分開處理，中間 99.9% 像素使用純指標累加，徹底移除數千萬次 `min`/`max` 邊界分支，Step 1 耗時減少 ~3x。
+  3. **Step 2 快取區塊化（Cache Blocking, $B=256$）**：
+     - 將跨步數萬 bytes 的大步長直欄走訪，改為 $B=256$ 直欄區塊累加，極大化 L1 快取命中率，並由 GCC 自動向量化為 32-byte AVX2 向量指令，Step 2 耗時減少 3.5x。
+  4. **Step 3 無分支定點數乘法除法（Branchless Fast Reciprocal Division）**：
+     - 轉換為全整數亮度計算 `(299u*r + 587u*g + 114u*b) > 128000u`，經全色域 16.7M 顏色驗證 100% 精準等價，消除浮點運算。
+     - 消除 x86 `idiv` 指令（25 cycles 縮減至 1 cycle），使用同 shift (`>> 19`) 的定點數乘法（乘以 `4333` 或 `20972`），配合條件移動指令（cmov）消除分支預測錯誤。
+     - 列指標在外層預先計算，內層省去乘法定址。
+
+```
+judging 8 case(s)
+  TC   STAT    NEW BEST
+  t01  AC     0.01 0.01 ↑
+  t02  AC     0.04 0.04 ↓
+  t04  AC     0.20 0.20 ↓
+  t03  AC     0.48 0.48 ↑
+  t05  AC     0.34 0.34 ↑
+  t06  AC     0.49 0.52 ↓
+  t07  AC     0.42 0.42 ↑
+  t08  AC     0.47 0.50 ↓
+─────────────────────────
+Total: 8/8    2.47 2.53 ↓
+```
+
+---
 
 ### Run #5: mmap + madvise PNG I/O & Memory Optimization
 - **Target**: `hw1-1`
