@@ -10,11 +10,45 @@
 | 4 | 2026-09-29 00:30 | hw1-1 | Zero-copy 1D RGB buffer (no vector<vector>), interleaved SAT_RGB, and -march=native AVX2 vectorization | 2.57 | 8/8 AC | 13.62x |
 | 5 | 2026-09-29 01:47 | hw1-1 | Zero-copy 1D RGB buffer, interleaved SAT_RGB, mmap + madvise PNG reading, fast uncompressed write | 2.53 | 8/8 AC | 13.84x |
 | 6 | 2026-09-29 02:03 | hw1-1 | Zero strip-alpha in libpng, cache-blocked Step 2 (B=256), border peeling Step 1, branchless fixed-point division (>> 19) | 2.47 | 8/8 AC | 14.17x |
-| 7 | 2026-09-29 02:16 | hw1-1 | Quiet CRC on read, 59KB cache-resident sliding window box filter (zero 220MB SAT allocation) | 2.15 | 8/8 AC | **16.28x** 🚀 |
+| 7 | 2026-09-29 02:16 | hw1-1 | Quiet CRC on read, 59KB cache-resident sliding window box filter (zero 220MB SAT allocation) | 2.15 | 8/8 AC | 16.28x |
+| 8 | 2026-09-29 02:28 | hw1-1 | Direct png_read_row stream, precomputed row pointers sliding window, -funroll-loops -fomit-frame-pointer | 2.13 | 8/8 AC | **16.44x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #8: Direct png_read_row Stream, Precomputed Row Pointers & Vector Unrolling
+- **Target**: `hw1-1`
+- **Date**: 2026-09-29 02:28
+- **Total Time**: 2.13s (8/8 AC) — **New Best!**
+- **Speedup vs Baseline**: 16.44x (vs v7: 1.01x)
+- **Leaderboard Rank**: Solidly locked into Top 20!
+- **Key Modifications**:
+  1. **`png_read_row` 零指針連續串流讀取**：
+     - 淘汰原本 `png_read_image` 需在 heap 上建立 `row_pointers` 二級指標的開銷，改為直接以 `png_read_row` 循序寫入連續記憶體，優化 CPU L1/L2 串流預取。
+  2. **滑動窗口列指標外層預計算（消滅 5 億次重複運算）**：
+     - 進入水平欄位迴圈前預先算出 4 條列指標（`row_a11`, `row_s11`, `row_a5`, `row_s5`），大幅減少內層重複的 `min/max` 與乘法定址。
+  3. **水平滑動去分支（Peeling `y = 0`）**：
+     - 將首個像素獨立於迴圈外處理，完全消除主體迴圈的 `if (y > 0)` 條件跳轉。
+  4. **激進化編譯旗標**：
+     - 在 Makefile 中追加 `-funroll-loops -fomit-frame-pointer`，進一步釋放暫存器並展開向量管線。
+
+```
+judging 8 case(s)
+  TC   STAT    NEW BEST
+  t01  AC     0.01 0.01 ↑
+  t02  AC     0.03 0.04 ↓
+  t04  AC     0.16 0.18 ↓
+  t03  AC     0.42 0.42 ↓
+  t05  AC     0.29 0.29 ↓
+  t06  AC     0.44 0.43 ↑
+  t07  AC     0.36 0.36 ↓
+  t08  AC     0.42 0.42 ↑
+─────────────────────────
+Total: 8/8    2.13 2.15 ↓
+```
+
+---
 
 ### Run #7: Quiet CRC & 59KB Cache-Resident Sliding Window
 - **Target**: `hw1-1`
