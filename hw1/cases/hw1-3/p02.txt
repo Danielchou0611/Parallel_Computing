@@ -1,0 +1,4 @@
+N=128
+T=60
+seed=1005
+timelimit=1

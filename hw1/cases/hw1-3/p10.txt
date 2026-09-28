@@ -1,0 +1,4 @@
+N=768
+T=6
+seed=1087
+timelimit=10

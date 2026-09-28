@@ -1,0 +1,5 @@
+N=384
+T=22
+seed=1028
+theta=0.6
+timelimit=5

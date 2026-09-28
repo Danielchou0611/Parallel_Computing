@@ -1,0 +1,4 @@
+N=192
+T=50
+seed=1024
+timelimit=2

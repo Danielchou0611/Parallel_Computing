@@ -1,0 +1,5 @@
+N=256
+T=40
+seed=1020
+cores=2
+timelimit=5

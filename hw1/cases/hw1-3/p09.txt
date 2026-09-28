@@ -1,0 +1,5 @@
+N=700
+T=8
+seed=1055
+theta=0.757
+timelimit=7.5

@@ -1,0 +1,5 @@
+N=512
+T=8
+seed=1035
+cores=4
+timelimit=5

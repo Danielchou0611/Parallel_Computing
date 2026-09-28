@@ -1,0 +1,4 @@
+N=640
+T=6
+seed=1049
+timelimit=7.5

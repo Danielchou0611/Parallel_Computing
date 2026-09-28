@@ -1,0 +1,4 @@
+N=512
+T=13
+seed=1043
+timelimit=7.5
