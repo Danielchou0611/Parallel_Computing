@@ -9,6 +9,10 @@
 #include <sched.h>
 #include <cstdint>
 #include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // ---------- adaptive filtering ----------
 
@@ -99,38 +103,52 @@ void adaptiveFilterRGB(
     free(sat);
 }
 
-// ---------- shared PNG I/O ----------
+// ---------- shared PNG I/O (mmap accelerated) ----------
+
+struct MemReader {
+    const uint8_t* buf;
+    size_t offset;
+};
+
+static void mem_read_fn(png_structp png, png_bytep data, png_size_t length) {
+    MemReader* reader = (MemReader*)png_get_io_ptr(png);
+    memcpy(data, reader->buf + reader->offset, length);
+    reader->offset += length;
+}
 
 uint8_t* read_png_file(char* file_name, int& width, int& height) {
-    FILE *fp = fopen(file_name, "rb");
-    if (!fp) {
+    int fd = open(file_name, O_RDONLY);
+    if (fd < 0) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
         exit(EXIT_FAILURE);
     }
+    struct stat st;
+    fstat(fd, &st);
+    size_t file_size = st.st_size;
+    const uint8_t* mapped = (const uint8_t*)mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        std::cerr << "Error: mmap failed on " << file_name << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    madvise((void*)mapped, file_size, MADV_WILLNEED | MADV_SEQUENTIAL);
+
+    MemReader reader = {mapped, 0};
 
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    if (!png) {
-        std::cerr << "Error: Cannot create PNG read structure" << std::endl;
-        fclose(fp);
-        exit(EXIT_FAILURE);
-    }
+    if (!png) exit(EXIT_FAILURE);
 
     png_infop info = png_create_info_struct(png);
-    if (!info) {
-        std::cerr << "Error: Cannot create PNG info structure" << std::endl;
-        png_destroy_read_struct(&png, nullptr, nullptr);
-        fclose(fp);
-        exit(EXIT_FAILURE);
-    }
+    if (!info) exit(EXIT_FAILURE);
 
     if (setjmp(png_jmpbuf(png))) {
         std::cerr << "Error during PNG creation" << std::endl;
         png_destroy_read_struct(&png, &info, nullptr);
-        fclose(fp);
+        munmap((void*)mapped, file_size);
         exit(EXIT_FAILURE);
     }
 
-    png_init_io(png, fp);
+    png_set_read_fn(png, &reader, mem_read_fn);
     png_read_info(png, info);
 
     width = png_get_image_width(png, info);
@@ -167,9 +185,9 @@ uint8_t* read_png_file(char* file_name, int& width, int& height) {
     }
 
     png_read_image(png, row_pointers);
-    fclose(fp);
     free(row_pointers);
     png_destroy_read_struct(&png, &info, nullptr);
+    munmap((void*)mapped, file_size);
 
     return raw_data;
 }
@@ -180,6 +198,9 @@ void write_png_file(char* file_name, const uint8_t* image_data, int width, int h
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
         exit(EXIT_FAILURE);
     }
+
+    char fbuf[1 << 20];
+    setvbuf(fp, fbuf, _IOFBF, sizeof(fbuf));
 
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     if (!png) {
