@@ -1,7 +1,7 @@
 # Builds hw1-1.cpp, hw1-2.cpp and hw1-3.cpp, each into its own program. Submit this file
 # to change the compilation flags, or to add sources and libraries of your own.
 CXX = g++
-CXXFLAGS = -std=c++11 -O3 -march=native -pthread -fopenmp
+CXXFLAGS = -std=c++11 -O3 -march=native -funroll-loops -fomit-frame-pointer -pthread -fopenmp
 LDLIBS = -lpng
 
 all: hw1-1 hw1-2 hw1-3

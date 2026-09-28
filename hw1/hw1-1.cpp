@@ -14,8 +14,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// ---------- adaptive sliding window filtering ----------
-
 struct RGB {
     uint32_t r, g, b;
 };
@@ -61,19 +59,59 @@ void sliding_box_filter(
 
         for (int r = r_start; r < r_end; r++) {
             if (r > r_start) {
-                for (int c = -5; c <= width + 5; c++) {
-                    int idx = c + 5;
-                    const uint8_t* add11 = get_pixel(r + 5, c);
-                    const uint8_t* sub11 = get_pixel(r - 6, c);
-                    col11[idx].r += add11[0] - sub11[0];
-                    col11[idx].g += add11[1] - sub11[1];
-                    col11[idx].b += add11[2] - sub11[2];
+                int r_a11 = std::min(std::max(r + 5, 0), height - 1);
+                int r_s11 = std::min(std::max(r - 6, 0), height - 1);
+                int r_a5  = std::min(std::max(r + 2, 0), height - 1);
+                int r_s5  = std::min(std::max(r - 3, 0), height - 1);
 
-                    const uint8_t* add5 = get_pixel(r + 2, c);
-                    const uint8_t* sub5 = get_pixel(r - 3, c);
-                    col5[idx].r += add5[0] - sub5[0];
-                    col5[idx].g += add5[1] - sub5[1];
-                    col5[idx].b += add5[2] - sub5[2];
+                const uint8_t* row_a11 = in_data + (size_t)r_a11 * width * channels;
+                const uint8_t* row_s11 = in_data + (size_t)r_s11 * width * channels;
+                const uint8_t* row_a5  = in_data + (size_t)r_a5  * width * channels;
+                const uint8_t* row_s5  = in_data + (size_t)r_s5  * width * channels;
+
+                // Left clamp c = -5 .. -1
+                for (int c = -5; c < 0; c++) {
+                    int idx = c + 5;
+                    col11[idx].r += row_a11[0] - row_s11[0];
+                    col11[idx].g += row_a11[1] - row_s11[1];
+                    col11[idx].b += row_a11[2] - row_s11[2];
+
+                    col5[idx].r += row_a5[0] - row_s5[0];
+                    col5[idx].g += row_a5[1] - row_s5[1];
+                    col5[idx].b += row_a5[2] - row_s5[2];
+                }
+
+                // Middle c = 0 .. width - 1
+                for (int c = 0; c < width; c++) {
+                    int idx = c + 5;
+                    const uint8_t* p_a11 = row_a11 + c * channels;
+                    const uint8_t* p_s11 = row_s11 + c * channels;
+                    const uint8_t* p_a5  = row_a5  + c * channels;
+                    const uint8_t* p_s5  = row_s5  + c * channels;
+
+                    col11[idx].r += p_a11[0] - p_s11[0];
+                    col11[idx].g += p_a11[1] - p_s11[1];
+                    col11[idx].b += p_a11[2] - p_s11[2];
+
+                    col5[idx].r += p_a5[0] - p_s5[0];
+                    col5[idx].g += p_a5[1] - p_s5[1];
+                    col5[idx].b += p_a5[2] - p_s5[2];
+                }
+
+                // Right clamp c = width .. width + 5
+                const uint8_t* end_a11 = row_a11 + (size_t)(width - 1) * channels;
+                const uint8_t* end_s11 = row_s11 + (size_t)(width - 1) * channels;
+                const uint8_t* end_a5  = row_a5  + (size_t)(width - 1) * channels;
+                const uint8_t* end_s5  = row_s5  + (size_t)(width - 1) * channels;
+                for (int c = width; c <= width + 5; c++) {
+                    int idx = c + 5;
+                    col11[idx].r += end_a11[0] - end_s11[0];
+                    col11[idx].g += end_a11[1] - end_s11[1];
+                    col11[idx].b += end_a11[2] - end_s11[2];
+
+                    col5[idx].r += end_a5[0] - end_s5[0];
+                    col5[idx].g += end_a5[1] - end_s5[1];
+                    col5[idx].b += end_a5[2] - end_s5[2];
                 }
             }
 
@@ -90,20 +128,30 @@ void sliding_box_filter(
             const uint8_t* in_row = in_data + (size_t)r * width * channels;
             uint8_t* out_row = out_data + (size_t)r * width * 3;
 
-            for (int y = 0; y < width; y++) {
-                if (y > 0) {
-                    int add11_idx = (y + 5) + 5;
-                    int sub11_idx = (y - 6) + 5;
-                    box11.r += col11[add11_idx].r - col11[sub11_idx].r;
-                    box11.g += col11[add11_idx].g - col11[sub11_idx].g;
-                    box11.b += col11[add11_idx].b - col11[sub11_idx].b;
+            // y = 0
+            {
+                const uint8_t* cur = in_row;
+                bool is_bright = (299u * cur[0] + 587u * cur[1] + 114u * cur[2]) > 128000u;
+                uint32_t mul = is_bright ? 4333u : 20972u;
+                const RGB& b = is_bright ? box11 : box5;
+                out_row[0] = (b.r * mul) >> 19;
+                out_row[1] = (b.g * mul) >> 19;
+                out_row[2] = (b.b * mul) >> 19;
+            }
 
-                    int add5_idx = (y + 2) + 5;
-                    int sub5_idx = (y - 3) + 5;
-                    box5.r += col5[add5_idx].r - col5[sub5_idx].r;
-                    box5.g += col5[add5_idx].g - col5[sub5_idx].g;
-                    box5.b += col5[add5_idx].b - col5[sub5_idx].b;
-                }
+            // y = 1 .. width - 1
+            for (int y = 1; y < width; y++) {
+                int add11_idx = y + 10;
+                int sub11_idx = y - 1;
+                box11.r += col11[add11_idx].r - col11[sub11_idx].r;
+                box11.g += col11[add11_idx].g - col11[sub11_idx].g;
+                box11.b += col11[add11_idx].b - col11[sub11_idx].b;
+
+                int add5_idx = y + 7;
+                int sub5_idx = y + 2;
+                box5.r += col5[add5_idx].r - col5[sub5_idx].r;
+                box5.g += col5[add5_idx].g - col5[sub5_idx].g;
+                box5.b += col5[add5_idx].b - col5[sub5_idx].b;
 
                 const uint8_t* cur = in_row + y * channels;
                 bool is_bright = (299u * cur[0] + 587u * cur[1] + 114u * cur[2]) > 128000u;
@@ -118,7 +166,7 @@ void sliding_box_filter(
     }
 }
 
-// ---------- shared PNG I/O (mmap accelerated) ----------
+// ---------- shared PNG I/O (mmap accelerated + direct streaming) ----------
 
 struct MemReader {
     const uint8_t* buf;
@@ -165,6 +213,7 @@ uint8_t* read_png_file(char* file_name, int& width, int& height, int& channels) 
 
     // Skip redundant chunk CRC calculations during read
     png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
+    png_set_compression_buffer_size(png, 2 * 1024 * 1024);
 
     png_set_read_fn(png, &reader, mem_read_fn);
     png_read_info(png, info);
@@ -190,19 +239,17 @@ uint8_t* read_png_file(char* file_name, int& width, int& height, int& channels) 
        color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
         png_set_gray_to_rgb(png);
 
-    // Keep RGBA if present to avoid expensive single-threaded strip_alpha transformation
     png_read_update_info(png, info);
 
     channels = png_get_channels(png, info);
     size_t row_bytes = png_get_rowbytes(png, info);
     uint8_t* raw_data = (uint8_t*)malloc(row_bytes * height);
-    png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    for(int y = 0; y < height; y++) {
-        row_pointers[y] = raw_data + y * row_bytes;
+
+    // Direct stream reading line by line (faster cold cache, no row_pointers allocation)
+    for (int y = 0; y < height; y++) {
+        png_read_row(png, raw_data + (size_t)y * row_bytes, nullptr);
     }
 
-    png_read_image(png, row_pointers);
-    free(row_pointers);
     png_destroy_read_struct(&png, &info, nullptr);
     munmap((void*)mapped, file_size);
 
