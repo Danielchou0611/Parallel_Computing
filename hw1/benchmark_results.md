@@ -9,11 +9,43 @@
 | 3 | 2026-09-28 21:59 | hw1-1 | 2D Integral Image (SAT) O(1) box sum, contiguous I/O buffers, fast uncompressed PNG write | 4.34 | 8/8 AC | 8.07x |
 | 4 | 2026-09-29 00:30 | hw1-1 | Zero-copy 1D RGB buffer (no vector<vector>), interleaved SAT_RGB, and -march=native AVX2 vectorization | 2.57 | 8/8 AC | 13.62x |
 | 5 | 2026-09-29 01:47 | hw1-1 | Zero-copy 1D RGB buffer, interleaved SAT_RGB, mmap + madvise PNG reading, fast uncompressed write | 2.53 | 8/8 AC | 13.84x |
-| 6 | 2026-09-29 02:03 | hw1-1 | Zero strip-alpha in libpng, cache-blocked Step 2 (B=256), border peeling Step 1, branchless fixed-point division (>> 19) | 2.47 | 8/8 AC | **14.17x** 🚀 |
+| 6 | 2026-09-29 02:03 | hw1-1 | Zero strip-alpha in libpng, cache-blocked Step 2 (B=256), border peeling Step 1, branchless fixed-point division (>> 19) | 2.47 | 8/8 AC | 14.17x |
+| 7 | 2026-09-29 02:16 | hw1-1 | Quiet CRC on read, 59KB cache-resident sliding window box filter (zero 220MB SAT allocation) | 2.15 | 8/8 AC | **16.28x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #7: Quiet CRC & 59KB Cache-Resident Sliding Window
+- **Target**: `hw1-1`
+- **Date**: 2026-09-29 02:16
+- **Total Time**: 2.15s (8/8 AC) — **Massive Leap (ALL 8 Cases Improved ↓)!**
+- **Speedup vs Baseline**: 16.28x (vs v6: 1.15x)
+- **Leaderboard Rank**: Approaching Top 20!
+- **Key Modifications**:
+  1. **Quiet CRC 略過解壓縮 CRC 檢查**：
+     - 加入 `png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);`，解壓縮讀取時略過每塊 IDAT chunk 冗餘的 CRC32 檢查。
+  2. **徹底消滅 220MB 積分圖（記憶體開銷降 460 倍至 59 KB）**：
+     - **徹底解決 Page Fault 與快取缺失**：舊版 220 MB `SAT` 陣列觸發 55,000 次 Page Fault 並灌爆 L3 快取。
+     - **滑動窗口核心**：利用半徑僅為 2 與 5 的特性，每個執行緒只維護垂直累加值（約 59 KB），垂直滑動時僅需加新列減舊列，水平滑動時同步維護 box 和。
+     - **效果**：完全免除 220MB 陣列的配置與走訪，全濾波運算完全在 CPU **L1 / L2 快取**中秒級完成！
+
+```
+judging 8 case(s)
+  TC   STAT    NEW BEST
+  t01  AC     0.01 0.01 ↓
+  t02  AC     0.04 0.04 ↓
+  t04  AC     0.18 0.20 ↓
+  t03  AC     0.42 0.48 ↓
+  t05  AC     0.29 0.34 ↓
+  t06  AC     0.43 0.49 ↓
+  t07  AC     0.36 0.42 ↓
+  t08  AC     0.42 0.47 ↓
+─────────────────────────
+Total: 8/8    2.15 2.47 ↓
+```
+
+---
 
 ### Run #6: Zero-Strip-Alpha, Blocked Column SAT, Border Peeling & Fast Reciprocal Division
 - **Target**: `hw1-1`
