@@ -8,11 +8,51 @@
 | 1 | 2026-09-30 01:24 | hw1-2 | Initial OpenMP Parallelization (gaussianBlur row-wise, detectKeypoints fork-join, computeDescriptor, matchFeatures preallocated slots) | 8.89 | 16/16 AC | ~4.50x |
 | 2 | 2026-09-30 01:50 | hw1-2 | Squared distance matching (eliminate sqrt), contiguous flatB descriptors, 4-way unroll distance, parallel dog & grayscale | 8.76 | 16/16 AC | ~4.57x |
 | 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | ~11.27x |
-| 4 | 2026-09-30 02:17 | hw1-2 | Layer-s cache-hot early exit for isExtremum, direct row pointers for edge test | 3.40 | 16/16 AC | **~11.76x** 🚀 |
+| 4 | 2026-09-30 02:17 | hw1-2 | Layer-s cache-hot early exit for isExtremum, direct row pointers for edge test | 3.40 | 16/16 AC | ~11.76x |
+| 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | **~12.42x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #5: 4-Tap Unrolled Vertical Blur Row Accumulation
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 02:31
+- **Total Time**: 3.22s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~12.42x (vs v4: **1.056x**, vs initial v1: **2.76x**)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Key Modifications**:
+  1. **4-tap 垂直高斯濾波行展開累加（4-tap Unrolled Vertical Row Accumulation）**：
+     - 將垂直濾波展開為 4 行同時累加至暫存器後才寫入記憶體，對目標列 `out_row` 的記憶體寫入次數直接縮減 4 倍（33 次降至 8 次），大幅消除快取 Write Buffer 飽和瓶頸。
+  2. **大圖測資全面提速**：
+     - `a08`: 0.62s ➔ **0.54s** ↓
+     - `b06`: 0.37s ➔ **0.34s** ↓
+     - `b08`: 0.72s ➔ **0.66s** ↓
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.02 ↑
+  a02  AC      0.04 0.04 ↓
+  a03  AC      0.07 0.06 ↑
+  a04  AC      0.08 0.11 ↓
+  a05  AC      0.16 0.14 ↑
+  a06  AC      0.13 0.16 ↓
+  a07  AC      0.42 0.36 ↑
+  b01  AC      0.02 0.02 ↑
+  a08  AC      0.54 0.62 ↓
+  b03  AC      0.06 0.05 ↑
+  b02  AC      0.03 0.04 ↓
+  b04  AC      0.09 0.09 ↓
+  b05  AC      0.09 0.09 ↓
+  b06  AC      0.34 0.37 ↓
+  b07  AC      0.49 0.50 ↓
+  b08  AC      0.66 0.72 ↓
+──────────────────────────
+Total: 16/16   3.22 3.40 ↓
+```
+
+---
 
 ### Run #4: Layer-s Cache-Hot Early Exit & Edge Test Direct Row Access
 - **Target**: `hw1-2`
