@@ -182,7 +182,6 @@ static void unfilter_row(uint8_t* cur, const uint8_t* prev, size_t n, int bpp) {
     }
 }
 
-#ifdef USE_LIBDEFLATE
 static void unfilter_image(FastPng& img) {
     const int bpp = img.channels;
     const size_t n = (size_t)img.width * img.channels;
@@ -196,7 +195,6 @@ static void unfilter_image(FastPng& img) {
         prev = cur + 1;
     }
 }
-#endif
 
 // Inflating the whole stream and then unfiltering it costs an extra round trip
 // through memory for images far larger than L2. Interleaving the two at a chunk
