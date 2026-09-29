@@ -6,35 +6,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <fstream>
-#include <chrono>
 // #include <pthread.h>
-#include <memory>
 #include <omp.h>
 #include <cstring>
 
 // ---------- shared PNG I/O ----------
 
-struct Mat {
-    int h = 0, w = 0;
-    std::shared_ptr<double> buf;
-    double* data = nullptr;
-
-    Mat() = default;
-    Mat(int height, int width) : h(height), w(width) {
-        if (h > 0 && w > 0) {
-            double* p = (double*)malloc(sizeof(double) * h * w);
-            buf = std::shared_ptr<double>(p, free);
-            data = p;
-        }
-    }
-
-    inline double* operator[](int y) { return data + y * w; }
-    inline const double* operator[](int y) const { return data + y * w; }
-    inline double* data_ptr() { return data; }
-    inline const double* data_ptr() const { return data; }
+struct RGB {
+    int r, g, b;
 };
 
-void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width) {
+using Mat = std::vector<std::vector<double>>;
+
+void read_png_file(const char* file_name, std::vector<std::vector<RGB>>& image) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -51,12 +35,10 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     png_init_io(png, fp);
     png_read_info(png, info);
 
-    width = png_get_image_width(png, info);
-    height = png_get_image_height(png, info);
+    int width = png_get_image_width(png, info);
+    int height = png_get_image_height(png, info);
     png_byte color_type = png_get_color_type(png, info);
     png_byte bit_depth = png_get_bit_depth(png, info);
-    png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
-    png_set_compression_buffer_size(png, 2 * 1024 * 1024);
 
     if (bit_depth == 16) png_set_strip_16(png);
     if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
@@ -70,31 +52,41 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
 
     png_read_update_info(png, info);
 
-    size_t rowbytes = png_get_rowbytes(png, info);
-    std::vector<png_byte> raw_buf(height * rowbytes);
-    std::vector<png_bytep> row_pointers(height);
+    png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
     for (int y = 0; y < height; y++)
-        row_pointers[y] = &raw_buf[y * rowbytes];
-
-    png_read_image(png, row_pointers.data());
+        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png, info));
+    png_read_image(png, row_pointers);
     fclose(fp);
-    png_destroy_read_struct(&png, &info, nullptr);
 
-    gray = Mat(height, width);
-    #pragma omp parallel for
+    image.resize(height, std::vector<RGB>(width));
     for (int y = 0; y < height; y++) {
-        const png_byte* row = &raw_buf[y * rowbytes];
-        double* gray_row = gray[y];
-        #pragma GCC ivdep
+        png_bytep row = row_pointers[y];
         for (int x = 0; x < width; x++) {
-            const png_byte* px = &row[x * 4];
-            gray_row[x] = (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]) / 255.0;
+            png_bytep px = &(row[x * 4]);
+            image[y][x].r = px[0];
+            image[y][x].g = px[1];
+            image[y][x].b = px[2];
         }
+        free(row_pointers[y]);
     }
+    free(row_pointers);
+    png_destroy_read_struct(&png, &info, nullptr);
 }
 
-// Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
-Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp_buf) {
+// ---------- grayscale + Gaussian scale space ----------
+
+Mat toGrayscale(const std::vector<std::vector<RGB>>& image, int height, int width) {
+    Mat gray(height, std::vector<double>(width));
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) {
+            const RGB& p = image[y][x];
+            gray[y][x] = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b) / 255.0;
+        }
+    return gray;
+}
+
+Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     int radius = std::max(1, (int)std::ceil(3 * sigma));
     std::vector<double> kernel(2 * radius + 1);
     double sum = 0.0;
@@ -105,82 +97,39 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp
     }
     for (double& v : kernel) v /= sum;
 
-    int K = 2 * radius + 1;
-    const double* k_ptr = kernel.data();
-
-    // Pass 1: Horizontal blur with boundary splitting (vectorized middle)
+    Mat tmp(height, std::vector<double>(width));
     #pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        const double* in_row = in[y];
-        double* tmp_row = tmp_buf + y * width;
-
-        int left_end = std::min(radius, width);
-        for (int x = 0; x < left_end; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int xx = std::min(std::max(x + i, 0), width - 1);
-                acc += in_row[xx] * k_ptr[i + radius];
-            }
-            tmp_row[x] = acc;
-        }
-
-        int right_start = std::max(radius, width - radius);
-        for (int x = left_end; x < right_start; x++) {
-            double acc = 0.0;
-            const double* p = in_row + (x - radius);
-            #pragma GCC ivdep
-            for (int i = 0; i < K; i++) {
-                acc += p[i] * k_ptr[i];
-            }
-            tmp_row[x] = acc;
-        }
-
-        for (int x = right_start; x < width; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int xx = std::min(std::max(x + i, 0), width - 1);
-                acc += in_row[xx] * k_ptr[i + radius];
-            }
-            tmp_row[x] = acc;
-        }
-    }
-
-    // Pass 2: Vertical blur (contiguous row accumulation)
-    Mat out(height, width);
-    #pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        double* out_row = out[y];
-        int y0 = std::min(std::max(y - radius, 0), height - 1);
-        const double* tmp_row0 = tmp_buf + y0 * width;
-        double k0 = k_ptr[0];
-        #pragma GCC ivdep
+    for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++) {
-            out_row[x] = tmp_row0[x] * k0;
-        }
-        for (int i = -radius + 1; i <= radius; i++) {
-            int yy = std::min(std::max(y + i, 0), height - 1);
-            const double* tmp_row = tmp_buf + yy * width;
-            double k = k_ptr[i + radius];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] += tmp_row[x] * k;
+            double acc = 0.0;
+            for (int i = -radius; i <= radius; i++) {
+                int xx = std::min(std::max(x + i, 0), width - 1);
+                acc += in[y][xx] * kernel[i + radius];
             }
+            tmp[y][x] = acc;
         }
-    }
+
+    Mat out(height, std::vector<double>(width));
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) {
+            double acc = 0.0;
+            for (int i = -radius; i <= radius; i++) {
+                int yy = std::min(std::max(y + i, 0), height - 1);
+                acc += tmp[yy][x] * kernel[i + radius];
+            }
+            out[y][x] = acc;
+        }
     return out;
 }
 
 Mat downsample2x(const Mat& in, int height, int width) {
     int nh = height / 2, nw = width / 2;
-    Mat out(nh, nw);
+    Mat out(nh, std::vector<double>(nw));
     #pragma omp parallel for
-    for (int y = 0; y < nh; y++) {
-        const double* in_row = in[2 * y];
-        double* out_row = out[y];
-        #pragma GCC ivdep
+    for (int y = 0; y < nh; y++)
         for (int x = 0; x < nw; x++)
-            out_row[x] = in_row[2 * x];
-    }
+            out[y][x] = in[2 * y][2 * x];
     return out;
 }
 
@@ -201,7 +150,6 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
     std::vector<Octave> octaves(NUM_OCTAVES);
     double k = std::pow(2.0, 1.0 / S);
 
-    std::vector<double> tmp_buf(height * width);
     Mat base = gray;
     int h = height, w = width;
     for (int o = 0; o < NUM_OCTAVES; o++) {
@@ -210,34 +158,17 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
         oct.width = w;
         oct.gaussian.resize(NUM_SCALES);
         oct.gaussian[0] = base;
-        auto t_o0 = std::chrono::high_resolution_clock::now();
         for (int s = 1; s < NUM_SCALES; s++) {
             double sigma = SIGMA0 * std::pow(k, s);
-            oct.gaussian[s] = gaussianBlur(base, h, w, sigma, tmp_buf.data());
+            oct.gaussian[s] = gaussianBlur(base, h, w, sigma);
         }
-        auto t_o1 = std::chrono::high_resolution_clock::now();
         oct.dog.resize(NUM_SCALES - 1);
         for (int s = 0; s < NUM_SCALES - 1; s++) {
-            oct.dog[s] = Mat(h, w);
-        }
-        int total = h * w;
-        #pragma omp parallel
-        {
-            for (int s = 0; s < NUM_SCALES - 1; s++) {
-                const double* g_next = oct.gaussian[s + 1].data_ptr();
-                const double* g_curr = oct.gaussian[s].data_ptr();
-                double* dog_ptr = oct.dog[s].data_ptr();
-                #pragma omp for nowait
-                for (int i = 0; i < total; i++)
-                    dog_ptr[i] = g_next[i] - g_curr[i];
-            }
-        }
-        auto t_o2 = std::chrono::high_resolution_clock::now();
-        if (getenv("PROFILE")) {
-            auto ms = [](std::chrono::high_resolution_clock::time_point a, std::chrono::high_resolution_clock::time_point b) {
-                return std::chrono::duration<double, std::milli>(b - a).count();
-            };
-            std::cerr << "    oct " << o << " (" << w << "x" << h << ") blur: " << ms(t_o0, t_o1) << " ms, dog: " << ms(t_o1, t_o2) << " ms\n";
+            oct.dog[s] = Mat(h, std::vector<double>(w));
+            #pragma omp parallel for
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    oct.dog[s][y][x] = oct.gaussian[s + 1][y][x] - oct.gaussian[s][y][x];
         }
 
         if (o + 1 < NUM_OCTAVES) {
@@ -284,8 +215,6 @@ bool passesEdgeTest(const Mat& d, int x, int y) {
     return ratio < (EDGE_THRESH_R + 1) * (EDGE_THRESH_R + 1) / EDGE_THRESH_R;
 }
 
-// Independent per (octave, layer, pixel) -- another natural parallelization
-// target. Extrema in different octaves/layers never interact.
 std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
     std::vector<Keypoint> keypoints;
     int max_threads = omp_get_max_threads();
@@ -324,9 +253,6 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
     return keypoints;
 }
 
-// ponytail: single dominant orientation per keypoint (no histogram-peak
-// splitting into multiple keypoints) -- simpler & still demonstrates the
-// weighted-histogram parallelization pattern without duplicating keypoints.
 void assignOrientation(Keypoint& kp, const Octave& oct) {
     const Mat& img = oct.gaussian[kp.layer];
     double sigma = 1.5 * kp.scale;
@@ -359,9 +285,6 @@ void assignOrientation(Keypoint& kp, const Octave& oct) {
     kp.orientation = best * (2 * M_PI / NBINS) - M_PI;
 }
 
-// Standard 4x4 cell x 8 orientation bin descriptor, sampled in a 16x16
-// window rotated to the keypoint orientation. Each keypoint's descriptor is
-// independent of every other's -- embarrassingly parallel across keypoints.
 void computeDescriptor(Keypoint& kp, const Octave& oct) {
     const Mat& img = oct.gaussian[kp.layer];
     const int WINDOW = 16, CELLS = 4, BINS = 8;
@@ -371,7 +294,6 @@ void computeDescriptor(Keypoint& kp, const Octave& oct) {
 
     for (int i = -WINDOW / 2; i < WINDOW / 2; i++) {
         for (int j = -WINDOW / 2; j < WINDOW / 2; j++) {
-            // rotate sample offset into the keypoint's dominant orientation
             double rx = j * cosA - i * sinA;
             double ry = j * sinA + i * cosA;
             int x = kp.x + (int)std::round(rx);
@@ -398,7 +320,7 @@ void computeDescriptor(Keypoint& kp, const Octave& oct) {
     double norm = 0.0;
     for (double v : desc) norm += v * v;
     norm = std::sqrt(norm) + 1e-12;
-    for (double& v : desc) v = std::min(v / norm, 0.2); // clip large gradients (illumination robustness)
+    for (double& v : desc) v = std::min(v / norm, 0.2);
 
     norm = 0.0;
     for (double v : desc) norm += v * v;
@@ -413,30 +335,18 @@ struct FeatureSet {
 };
 
 FeatureSet extractFeatures(const Mat& gray, int height, int width) {
-    auto t0 = std::chrono::high_resolution_clock::now();
     auto octaves = buildPyramid(gray, height, width);
-    auto t1 = std::chrono::high_resolution_clock::now();
     auto keypoints = detectKeypoints(octaves);
-    auto t2 = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for
     for (size_t i = 0; i < keypoints.size(); i++) {
         assignOrientation(keypoints[i], octaves[keypoints[i].octave]);
         computeDescriptor(keypoints[i], octaves[keypoints[i].octave]);
-    }
-    auto t3 = std::chrono::high_resolution_clock::now();
-    if (getenv("PROFILE")) {
-        typedef std::chrono::high_resolution_clock::time_point TP;
-        auto ms = [](TP a, TP b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        std::cerr << "  -- buildPyramid: " << ms(t0, t1) << " ms\n"
-                  << "  -- detectKeypoints: " << ms(t1, t2) << " ms\n"
-                  << "  -- orientation+desc: " << ms(t2, t3) << " ms\n";
     }
     FeatureSet fs;
     fs.keypoints = std::move(keypoints);
     return fs;
 }
 
-// image-space coordinates, for reporting (octave 0 = full resolution)
 void imageCoords(const Keypoint& kp, double& ix, double& iy) {
     double scaleFactor = std::pow(2.0, kp.octave);
     ix = kp.x * scaleFactor;
@@ -473,8 +383,6 @@ inline double descriptorDistSq(const double* a, const double* b) {
     return (s0 + s1) + (s2 + s3);
 }
 
-// Brute-force nearest neighbor + Lowe's ratio test. Each query keypoint in A
-// is matched independently against all of B -- parallelize over A.
 const double RATIO_THRESH_SQ = 0.75 * 0.75; // 0.5625
 
 std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
@@ -482,7 +390,6 @@ std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
     const size_t numB = b.keypoints.size();
     std::vector<Match> match_per_kp(numA, {-1, -1, 0.0});
 
-    // Flatten all descriptors of B into a single contiguous cache-friendly block
     std::vector<double> flatB(numB * 128);
     for (size_t j = 0; j < numB; j++) {
         memcpy(flatB.data() + j * 128, b.keypoints[j].descriptor.data(), 128 * sizeof(double));
@@ -553,47 +460,22 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<std::vector<RGB>> imageA, imageB;
+    read_png_file(argv[1], imageA);
+    read_png_file(argv[2], imageB);
 
-    Mat grayA, grayB;
-    int heightA = 0, widthA = 0;
-    int heightB = 0, widthB = 0;
+    int heightA = imageA.size(), widthA = imageA[0].size();
+    int heightB = imageB.size(), widthB = imageB[0].size();
 
-    #pragma omp parallel sections
-    {
-        #pragma omp section
-        {
-            read_png_to_gray(argv[1], grayA, heightA, widthA);
-        }
-        #pragma omp section
-        {
-            read_png_to_gray(argv[2], grayB, heightB, widthB);
-        }
-    }
-    auto t_read = std::chrono::high_resolution_clock::now();
+    Mat grayA = toGrayscale(imageA, heightA, widthA);
+    Mat grayB = toGrayscale(imageB, heightB, widthB);
 
     FeatureSet featuresA = extractFeatures(grayA, heightA, widthA);
-    auto t_featA = std::chrono::high_resolution_clock::now();
-
     FeatureSet featuresB = extractFeatures(grayB, heightB, widthB);
-    auto t_featB = std::chrono::high_resolution_clock::now();
 
     std::vector<Match> matches = matchFeatures(featuresA, featuresB);
-    auto t_match = std::chrono::high_resolution_clock::now();
 
     writeOutput(argv[3], featuresA, featuresB, matches);
-    auto t_write = std::chrono::high_resolution_clock::now();
-
-    if (getenv("PROFILE")) {
-        typedef std::chrono::high_resolution_clock::time_point TP;
-        auto ms = [](TP a, TP b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        std::cerr << "Read PNG+Gray: " << ms(t0, t_read) << " ms\n"
-                  << "Extract A:     " << ms(t_read, t_featA) << " ms (kps: " << featuresA.keypoints.size() << ")\n"
-                  << "Extract B:     " << ms(t_featA, t_featB) << " ms (kps: " << featuresB.keypoints.size() << ")\n"
-                  << "Match:         " << ms(t_featB, t_match) << " ms (matches: " << matches.size() << ")\n"
-                  << "Write:         " << ms(t_match, t_write) << " ms\n"
-                  << "Total:         " << ms(t0, t_write) << " ms\n";
-    }
 
     return 0;
 }
