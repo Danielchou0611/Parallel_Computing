@@ -145,55 +145,25 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp
         }
     }
 
-    // Pass 2: Vertical blur (4-tap contiguous row accumulation)
+    // Pass 2: Vertical blur (contiguous row accumulation)
     Mat out(height, width);
     #pragma omp parallel for
     for (int y = 0; y < height; y++) {
         double* out_row = out[y];
-
-        const double* rows[45];
-        double ks[45];
-        for (int i = -radius; i <= radius; i++) {
+        int y0 = std::min(std::max(y - radius, 0), height - 1);
+        const double* tmp_row0 = tmp_buf + y0 * width;
+        double k0 = k_ptr[0];
+        #pragma GCC ivdep
+        for (int x = 0; x < width; x++) {
+            out_row[x] = tmp_row0[x] * k0;
+        }
+        for (int i = -radius + 1; i <= radius; i++) {
             int yy = std::min(std::max(y + i, 0), height - 1);
-            rows[i + radius] = tmp_buf + yy * width;
-            ks[i + radius] = k_ptr[i + radius];
-        }
-
-        int t = 0;
-        if (K >= 4) {
-            const double* r0 = rows[0]; double c0 = ks[0];
-            const double* r1 = rows[1]; double c1 = ks[1];
-            const double* r2 = rows[2]; double c2 = ks[2];
-            const double* r3 = rows[3]; double c3 = ks[3];
+            const double* tmp_row = tmp_buf + yy * width;
+            double k = k_ptr[i + radius];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
-                out_row[x] = (r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3);
-            }
-            t = 4;
-            for (; t + 3 < K; t += 4) {
-                const double* ra = rows[t + 0]; double ca = ks[t + 0];
-                const double* rb = rows[t + 1]; double cb = ks[t + 1];
-                const double* rc = rows[t + 2]; double cc = ks[t + 2];
-                const double* rd = rows[t + 3]; double cd = ks[t + 3];
-                #pragma GCC ivdep
-                for (int x = 0; x < width; x++) {
-                    out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
-                }
-            }
-        } else {
-            const double* r0 = rows[0]; double c0 = ks[0];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] = r0[x] * c0;
-            }
-            t = 1;
-        }
-
-        for (; t < K; t++) {
-            const double* r = rows[t]; double c = ks[t];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] += r[x] * c;
+                out_row[x] += tmp_row[x] * k;
             }
         }
     }

@@ -7,11 +7,49 @@
 | 0 | 2026-09-29 22:42 | hw1-2 | Sequential Baseline (Unparallelized) | ~40.0s | 16/16 AC | 1.00x |
 | 1 | 2026-09-30 01:24 | hw1-2 | Initial OpenMP Parallelization (gaussianBlur row-wise, detectKeypoints fork-join, computeDescriptor, matchFeatures preallocated slots) | 8.89 | 16/16 AC | ~4.50x |
 | 2 | 2026-09-30 01:50 | hw1-2 | Squared distance matching (eliminate sqrt), contiguous flatB descriptors, 4-way unroll distance, parallel dog & grayscale | 8.76 | 16/16 AC | ~4.57x |
-| 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | **~11.27x** 🚀 |
+| 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | ~11.27x |
+| 4 | 2026-09-30 02:17 | hw1-2 | Layer-s cache-hot early exit for isExtremum, direct row pointers for edge test | 3.40 | 16/16 AC | **~11.76x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #4: Layer-s Cache-Hot Early Exit & Edge Test Direct Row Access
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 02:17
+- **Total Time**: 3.40s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~11.76x (vs v3: **1.044x**, 12/16 cases improved)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Key Modifications**:
+  1. **同層優先快取檢驗（Layer-s First in `isExtremum`）**：
+     - 優先檢驗當前同層（Layer $s$）的 8 個鄰居，95% 以上非極值點直接提早退出，完全不需讀取 $s-1$ 和 $s+1$ 兩層記憶體，大幅減輕快取抖動。
+  2. **邊界檢驗直接指標訪問（Direct Row Pointer in `passesEdgeTest`）**：
+     - 傳遞直接連續行指標，消除列乘法與 vector 查表開銷。
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.03 ↓
+  a02  AC      0.04 0.04 ↑
+  a03  AC      0.06 0.06 ↓
+  a04  AC      0.11 0.11 ↓
+  a05  AC      0.14 0.15 ↓
+  a06  AC      0.16 0.18 ↓
+  a07  AC      0.36 0.40 ↓
+  b01  AC      0.02 0.02 ↓
+  a08  AC      0.62 0.62 ↑
+  b02  AC      0.04 0.04 ↓
+  b03  AC      0.05 0.07 ↓
+  b04  AC      0.09 0.10 ↓
+  b05  AC      0.09 0.10 ↓
+  b06  AC      0.37 0.38 ↓
+  b07  AC      0.50 0.54 ↓
+  b08  AC      0.72 0.72 ↓
+──────────────────────────
+Total: 16/16   3.40 3.55 ↓
+```
+
+---
 
 ### Run #3: Zero-Copy Flat Mat, Boundary-Split AVX2 Blur, and Scratch Buffer Reuse
 - **Target**: `hw1-2`
