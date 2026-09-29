@@ -259,24 +259,45 @@ struct Keypoint {
     std::vector<double> descriptor;
 };
 
-bool isExtremum(const std::vector<Mat>& dog, int s, int x, int y) {
+inline bool isExtremum(const std::vector<Mat>& dog, int s, int x, int y) {
     double v = dog[s][y][x];
     bool isMax = true, isMin = true;
-    for (int ds = -1; ds <= 1 && (isMax || isMin); ds++)
-        for (int dy = -1; dy <= 1 && (isMax || isMin); dy++)
-            for (int dx = -1; dx <= 1 && (isMax || isMin); dx++) {
-                if (ds == 0 && dy == 0 && dx == 0) continue;
-                double n = dog[s + ds][y + dy][x + dx];
-                if (n >= v) isMax = false;
-                if (n <= v) isMin = false;
-            }
+
+    // Check same layer first (cache hot, eliminates >95% of non-extrema immediately)
+    const double* r0 = dog[s][y - 1];
+    const double* r1 = dog[s][y];
+    const double* r2 = dog[s][y + 1];
+
+    double n;
+    #define CHK(val) do { n = (val); if (n >= v) isMax = false; if (n <= v) isMin = false; if (!isMax && !isMin) return false; } while(0)
+    CHK(r0[x - 1]); CHK(r0[x]); CHK(r0[x + 1]);
+    CHK(r1[x - 1]);             CHK(r1[x + 1]);
+    CHK(r2[x - 1]); CHK(r2[x]); CHK(r2[x + 1]);
+
+    // Check layer s - 1
+    const double* p0 = dog[s - 1][y - 1];
+    const double* p1 = dog[s - 1][y];
+    const double* p2 = dog[s - 1][y + 1];
+    CHK(p0[x - 1]); CHK(p0[x]); CHK(p0[x + 1]);
+    CHK(p1[x - 1]); CHK(p1[x]); CHK(p1[x + 1]);
+    CHK(p2[x - 1]); CHK(p2[x]); CHK(p2[x + 1]);
+
+    // Check layer s + 1
+    const double* q0 = dog[s + 1][y - 1];
+    const double* q1 = dog[s + 1][y];
+    const double* q2 = dog[s + 1][y + 1];
+    CHK(q0[x - 1]); CHK(q0[x]); CHK(q0[x + 1]);
+    CHK(q1[x - 1]); CHK(q1[x]); CHK(q1[x + 1]);
+    CHK(q2[x - 1]); CHK(q2[x]); CHK(q2[x + 1]);
+    #undef CHK
+
     return isMax || isMin;
 }
 
-bool passesEdgeTest(const Mat& d, int x, int y) {
-    double dxx = d[y][x + 1] + d[y][x - 1] - 2 * d[y][x];
-    double dyy = d[y + 1][x] + d[y - 1][x] - 2 * d[y][x];
-    double dxy = (d[y + 1][x + 1] - d[y + 1][x - 1] - d[y - 1][x + 1] + d[y - 1][x]) / 4.0;
+inline bool passesEdgeTest(const double* ym1, const double* y0, const double* yp1, int x) {
+    double dxx = y0[x + 1] + y0[x - 1] - 2 * y0[x];
+    double dyy = yp1[x] + ym1[x] - 2 * y0[x];
+    double dxy = (yp1[x + 1] - yp1[x - 1] - ym1[x + 1] + ym1[x]) / 4.0;
     double trace = dxx + dyy;
     double det = dxx * dyy - dxy * dxy;
     if (det <= 0) return false;
@@ -300,10 +321,13 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
                 int tid = omp_get_thread_num();
                 #pragma omp for schedule(static)
                 for (int y = 1; y < oct.height - 1; y++) {
+                    const double* d_ym1 = oct.dog[s][y - 1];
+                    const double* d_y0  = oct.dog[s][y];
+                    const double* d_yp1 = oct.dog[s][y + 1];
                     for (int x = 1; x < oct.width - 1; x++) {
-                        if (std::fabs(oct.dog[s][y][x]) < CONTRAST_THRESH) continue;
+                        if (std::fabs(d_y0[x]) < CONTRAST_THRESH) continue;
                         if (!isExtremum(oct.dog, s, x, y)) continue;
-                        if (!passesEdgeTest(oct.dog[s], x, y)) continue;
+                        if (!passesEdgeTest(d_ym1, d_y0, d_yp1, x)) continue;
 
                         Keypoint kp;
                         kp.octave = o;
