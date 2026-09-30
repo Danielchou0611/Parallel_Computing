@@ -99,8 +99,14 @@ static void init_lut() {
     }
 }
 
-void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width) {
-    init_lut();
+struct RawImage {
+    int height = 0, width = 0, channels = 0;
+    size_t rowbytes = 0;
+    png_byte* raw_buf = nullptr;
+    ~RawImage() { if (raw_buf) free(raw_buf); }
+};
+
+void read_png_raw(const char* file_name, RawImage& raw) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -117,8 +123,8 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     png_init_io(png, fp);
     png_read_info(png, info);
 
-    width = png_get_image_width(png, info);
-    height = png_get_image_height(png, info);
+    raw.width = png_get_image_width(png, info);
+    raw.height = png_get_image_height(png, info);
     png_byte color_type = png_get_color_type(png, info);
     png_byte bit_depth = png_get_bit_depth(png, info);
     png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
@@ -131,22 +137,30 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
 
     png_read_update_info(png, info);
 
-    int channels = png_get_channels(png, info);
-    size_t rowbytes = png_get_rowbytes(png, info);
-    std::vector<png_byte> raw_buf(height * rowbytes);
-    std::vector<png_bytep> row_pointers(height);
-    for (int y = 0; y < height; y++)
-        row_pointers[y] = &raw_buf[y * rowbytes];
+    raw.channels = png_get_channels(png, info);
+    raw.rowbytes = png_get_rowbytes(png, info);
+    raw.raw_buf = (png_byte*)malloc(raw.height * raw.rowbytes);
+
+    std::vector<png_bytep> row_pointers(raw.height);
+    for (int y = 0; y < raw.height; y++)
+        row_pointers[y] = raw.raw_buf + y * raw.rowbytes;
 
     png_read_image(png, row_pointers.data());
     fclose(fp);
     png_destroy_read_struct(&png, &info, nullptr);
+}
 
+void raw_to_gray(const RawImage& raw, Mat& gray) {
+    init_lut();
+    int height = raw.height, width = raw.width, channels = raw.channels;
+    size_t rowbytes = raw.rowbytes;
+    const png_byte* raw_buf = raw.raw_buf;
     gray = Mat(height, width);
+
     if (channels == 1) {
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            const png_byte* row = &raw_buf[y * rowbytes];
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -154,9 +168,9 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
             }
         }
     } else if (channels == 3) {
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            const png_byte* row = &raw_buf[y * rowbytes];
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -165,9 +179,9 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
             }
         }
     } else {
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            const png_byte* row = &raw_buf[y * rowbytes];
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -178,24 +192,53 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     }
 }
 
-// Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
-void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp_buf, Mat& out) {
-    int radius = std::max(1, (int)std::ceil(3 * sigma));
-    std::vector<double> kernel(2 * radius + 1);
-    double sum = 0.0;
-    for (int i = -radius; i <= radius; i++) {
-        double v = std::exp(-(i * i) / (2.0 * sigma * sigma));
-        kernel[i + radius] = v;
-        sum += v;
-    }
-    for (double& v : kernel) v /= sum;
+const int NUM_OCTAVES = 4;
+const int S = 3;              // Lowe's scales-per-octave
+const int NUM_SCALES = S + 3; // Gaussian images per octave
+const double SIGMA0 = 1.6;
+const double CONTRAST_THRESH = 0.03;
+const double EDGE_THRESH_R = 10.0;
 
-    int K = 2 * radius + 1;
-    const double* k_ptr = kernel.data();
+struct GaussianKernel {
+    int radius = 0;
+    int K = 0;
+    double kernel[45];
     __m256d k_vecs[45];
-    for (int i = 0; i < K; i++) {
-        k_vecs[i] = _mm256_set1_pd(k_ptr[i]);
+};
+
+static GaussianKernel s_kernels[NUM_SCALES];
+static bool s_kernels_inited = false;
+
+static void init_gaussian_kernels() {
+    if (s_kernels_inited) return;
+    double k = std::pow(2.0, 1.0 / S);
+    for (int s = 1; s < NUM_SCALES; s++) {
+        double sigma = SIGMA0 * std::pow(k, s);
+        int radius = std::max(1, (int)std::ceil(3 * sigma));
+        int K = 2 * radius + 1;
+        s_kernels[s].radius = radius;
+        s_kernels[s].K = K;
+
+        double sum = 0.0;
+        for (int i = -radius; i <= radius; i++) {
+            double v = std::exp(-(i * i) / (2.0 * sigma * sigma));
+            s_kernels[s].kernel[i + radius] = v;
+            sum += v;
+        }
+        for (int i = 0; i < K; i++) {
+            s_kernels[s].kernel[i] /= sum;
+            s_kernels[s].k_vecs[i] = _mm256_set1_pd(s_kernels[s].kernel[i]);
+        }
     }
+    s_kernels_inited = true;
+}
+
+// Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
+void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk, double* tmp_buf, Mat& out) {
+    int radius = gk.radius;
+    int K = gk.K;
+    const double* k_ptr = gk.kernel;
+    const __m256d* k_vecs = gk.k_vecs;
 
     #pragma omp parallel
     {
@@ -217,6 +260,20 @@ void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tm
 
             int right_start = std::max(radius, width - radius);
             int x = left_end;
+            for (; x + 7 < right_start; x += 8) {
+                __m256d acc0 = _mm256_setzero_pd();
+                __m256d acc1 = _mm256_setzero_pd();
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    __m256d kv = k_vecs[i];
+                    __m256d p0 = _mm256_loadu_pd(p + i);
+                    __m256d p1 = _mm256_loadu_pd(p + i + 4);
+                    acc0 = _mm256_add_pd(acc0, _mm256_mul_pd(p0, kv));
+                    acc1 = _mm256_add_pd(acc1, _mm256_mul_pd(p1, kv));
+                }
+                _mm256_storeu_pd(tmp_row + x, acc0);
+                _mm256_storeu_pd(tmp_row + x + 4, acc1);
+            }
             for (; x + 3 < right_start; x += 4) {
                 __m256d acc = _mm256_setzero_pd();
                 const double* p = in_row + (x - radius);
@@ -245,42 +302,60 @@ void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tm
             }
         }
 
-        // Pass 2: Vertical blur (4-tap contiguous row accumulation)
+        // Pass 2: Vertical blur (8-tap contiguous row accumulation)
         #pragma omp for schedule(static)
         for (int y = 0; y < height; y++) {
             double* out_row = out[y];
 
             const double* rows[45];
-            double ks[45];
             for (int i = -radius; i <= radius; i++) {
                 int yy = std::min(std::max(y + i, 0), height - 1);
                 rows[i + radius] = tmp_buf + yy * width;
-                ks[i + radius] = k_ptr[i + radius];
             }
 
             int t = 0;
-            if (K >= 4) {
-                const double* r0 = rows[0]; double c0 = ks[0];
-                const double* r1 = rows[1]; double c1 = ks[1];
-                const double* r2 = rows[2]; double c2 = ks[2];
-                const double* r3 = rows[3]; double c3 = ks[3];
+            if (K >= 8) {
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
+                const double* r1 = rows[1]; double c1 = k_ptr[1];
+                const double* r2 = rows[2]; double c2 = k_ptr[2];
+                const double* r3 = rows[3]; double c3 = k_ptr[3];
+                const double* r4 = rows[4]; double c4 = k_ptr[4];
+                const double* r5 = rows[5]; double c5 = k_ptr[5];
+                const double* r6 = rows[6]; double c6 = k_ptr[6];
+                const double* r7 = rows[7]; double c7 = k_ptr[7];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] = ((r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3)) +
+                                 ((r4[x] * c4 + r5[x] * c5) + (r6[x] * c6 + r7[x] * c7));
+                }
+                t = 8;
+                for (; t + 7 < K; t += 8) {
+                    const double* ra = rows[t + 0]; double ca = k_ptr[t + 0];
+                    const double* rb = rows[t + 1]; double cb = k_ptr[t + 1];
+                    const double* rc = rows[t + 2]; double cc = k_ptr[t + 2];
+                    const double* rd = rows[t + 3]; double cd = k_ptr[t + 3];
+                    const double* re = rows[t + 4]; double ce = k_ptr[t + 4];
+                    const double* rf = rows[t + 5]; double cf = k_ptr[t + 5];
+                    const double* rg = rows[t + 6]; double cg = k_ptr[t + 6];
+                    const double* rh = rows[t + 7]; double ch = k_ptr[t + 7];
+                    #pragma GCC ivdep
+                    for (int x = 0; x < width; x++) {
+                        out_row[x] += ((ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd)) +
+                                      ((re[x] * ce + rf[x] * cf) + (rg[x] * cg + rh[x] * ch));
+                    }
+                }
+            } else if (K >= 4) {
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
+                const double* r1 = rows[1]; double c1 = k_ptr[1];
+                const double* r2 = rows[2]; double c2 = k_ptr[2];
+                const double* r3 = rows[3]; double c3 = k_ptr[3];
                 #pragma GCC ivdep
                 for (int x = 0; x < width; x++) {
                     out_row[x] = (r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3);
                 }
                 t = 4;
-                for (; t + 3 < K; t += 4) {
-                    const double* ra = rows[t + 0]; double ca = ks[t + 0];
-                    const double* rb = rows[t + 1]; double cb = ks[t + 1];
-                    const double* rc = rows[t + 2]; double cc = ks[t + 2];
-                    const double* rd = rows[t + 3]; double cd = ks[t + 3];
-                    #pragma GCC ivdep
-                    for (int x = 0; x < width; x++) {
-                        out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
-                    }
-                }
             } else {
-                const double* r0 = rows[0]; double c0 = ks[0];
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
                 #pragma GCC ivdep
                 for (int x = 0; x < width; x++) {
                     out_row[x] = r0[x] * c0;
@@ -288,8 +363,19 @@ void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tm
                 t = 1;
             }
 
+            for (; t + 3 < K; t += 4) {
+                const double* ra = rows[t + 0]; double ca = k_ptr[t + 0];
+                const double* rb = rows[t + 1]; double cb = k_ptr[t + 1];
+                const double* rc = rows[t + 2]; double cc = k_ptr[t + 2];
+                const double* rd = rows[t + 3]; double cd = k_ptr[t + 3];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
+                }
+            }
+
             for (; t < K; t++) {
-                const double* r = rows[t]; double c = ks[t];
+                const double* r = rows[t]; double c = k_ptr[t];
                 #pragma GCC ivdep
                 for (int x = 0; x < width; x++) {
                     out_row[x] += r[x] * c;
@@ -311,13 +397,6 @@ void downsample2x(const Mat& in, int height, int width, Mat& out) {
     }
 }
 
-const int NUM_OCTAVES = 4;
-const int S = 3;              // Lowe's scales-per-octave
-const int NUM_SCALES = S + 3; // Gaussian images per octave
-const double SIGMA0 = 1.6;
-const double CONTRAST_THRESH = 0.03;
-const double EDGE_THRESH_R = 10.0;
-
 struct Octave {
     int height, width;
     std::vector<Mat> gaussian; // NUM_SCALES images
@@ -325,8 +404,8 @@ struct Octave {
 };
 
 std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferPool& pool) {
+    init_gaussian_kernels();
     std::vector<Octave> octaves(NUM_OCTAVES);
-    double k = std::pow(2.0, 1.0 / S);
 
     Mat tmp_mat = pool.allocMat(height, width);
     double* tmp_buf = tmp_mat.data_ptr();
@@ -340,9 +419,8 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferP
         oct.gaussian[0] = base;
         auto t_o0 = std::chrono::high_resolution_clock::now();
         for (int s = 1; s < NUM_SCALES; s++) {
-            double sigma = SIGMA0 * std::pow(k, s);
             oct.gaussian[s] = pool.allocMat(h, w);
-            gaussianBlur(base, h, w, sigma, tmp_buf, oct.gaussian[s]);
+            gaussianBlur(base, h, w, s_kernels[s], tmp_buf, oct.gaussian[s]);
         }
         auto t_o1 = std::chrono::high_resolution_clock::now();
         oct.dog.resize(NUM_SCALES - 1);
@@ -394,36 +472,50 @@ struct Keypoint {
     std::vector<double> descriptor;
 };
 
-inline bool isExtremum(double v, const Mat& d_prev, const Mat& d_next,
-                       const double* r0, const double* r1, const double* r2,
-                       int x, int y) {
-    bool isMax = true, isMin = true;
+struct DogSlice {
+    const double* r0; const double* r1; const double* r2;
+    const double* p0; const double* p1; const double* p2;
+    const double* q0; const double* q1; const double* q2;
+};
 
-    // Check same layer first (cache hot, eliminates >95% of non-extrema immediately)
-    double n;
-    #define CHK(val) do { n = (val); if (n >= v) isMax = false; if (n <= v) isMin = false; if (!isMax && !isMin) return false; } while(0)
-    CHK(r0[x - 1]); CHK(r0[x]); CHK(r0[x + 1]);
-    CHK(r1[x - 1]);             CHK(r1[x + 1]);
-    CHK(r2[x - 1]); CHK(r2[x]); CHK(r2[x + 1]);
+inline bool isExtremum(double v, const DogSlice& sl, int x) {
+    double n0 = sl.r0[x - 1];
+    if (n0 == v) return false;
+    if (n0 < v) {
+        // v can only be maximum
+        if (sl.r0[x] >= v || sl.r0[x + 1] >= v) return false;
+        if (sl.r1[x - 1] >= v || sl.r1[x + 1] >= v) return false;
+        if (sl.r2[x - 1] >= v || sl.r2[x] >= v || sl.r2[x + 1] >= v) return false;
 
-    // Check layer s - 1
-    const double* p0 = d_prev[y - 1];
-    const double* p1 = d_prev[y];
-    const double* p2 = d_prev[y + 1];
-    CHK(p0[x - 1]); CHK(p0[x]); CHK(p0[x + 1]);
-    CHK(p1[x - 1]); CHK(p1[x]); CHK(p1[x + 1]);
-    CHK(p2[x - 1]); CHK(p2[x]); CHK(p2[x + 1]);
+        // Check prev layer
+        if (sl.p0[x - 1] >= v || sl.p0[x] >= v || sl.p0[x + 1] >= v) return false;
+        if (sl.p1[x - 1] >= v || sl.p1[x] >= v || sl.p1[x + 1] >= v) return false;
+        if (sl.p2[x - 1] >= v || sl.p2[x] >= v || sl.p2[x + 1] >= v) return false;
 
-    // Check layer s + 1
-    const double* q0 = d_next[y - 1];
-    const double* q1 = d_next[y];
-    const double* q2 = d_next[y + 1];
-    CHK(q0[x - 1]); CHK(q0[x]); CHK(q0[x + 1]);
-    CHK(q1[x - 1]); CHK(q1[x]); CHK(q1[x + 1]);
-    CHK(q2[x - 1]); CHK(q2[x]); CHK(q2[x + 1]);
-    #undef CHK
+        // Check next layer
+        if (sl.q0[x - 1] >= v || sl.q0[x] >= v || sl.q0[x + 1] >= v) return false;
+        if (sl.q1[x - 1] >= v || sl.q1[x] >= v || sl.q1[x + 1] >= v) return false;
+        if (sl.q2[x - 1] >= v || sl.q2[x] >= v || sl.q2[x + 1] >= v) return false;
 
-    return isMax || isMin;
+        return true;
+    } else {
+        // v can only be minimum
+        if (sl.r0[x] <= v || sl.r0[x + 1] <= v) return false;
+        if (sl.r1[x - 1] <= v || sl.r1[x + 1] <= v) return false;
+        if (sl.r2[x - 1] <= v || sl.r2[x] <= v || sl.r2[x + 1] <= v) return false;
+
+        // Check prev layer
+        if (sl.p0[x - 1] <= v || sl.p0[x] <= v || sl.p0[x + 1] <= v) return false;
+        if (sl.p1[x - 1] <= v || sl.p1[x] <= v || sl.p1[x + 1] <= v) return false;
+        if (sl.p2[x - 1] <= v || sl.p2[x] <= v || sl.p2[x + 1] <= v) return false;
+
+        // Check next layer
+        if (sl.q0[x - 1] <= v || sl.q0[x] <= v || sl.q0[x + 1] <= v) return false;
+        if (sl.q1[x - 1] <= v || sl.q1[x] <= v || sl.q1[x + 1] <= v) return false;
+        if (sl.q2[x - 1] <= v || sl.q2[x] <= v || sl.q2[x + 1] <= v) return false;
+
+        return true;
+    }
 }
 
 inline bool passesEdgeTest(const double* ym1, const double* y0, const double* yp1, int x) {
@@ -458,13 +550,18 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
                 int tid = omp_get_thread_num();
                 #pragma omp for schedule(static)
                 for (int y = 1; y < oct.height - 1; y++) {
-                    const double* d_ym1 = d_curr[y - 1];
-                    const double* d_y0  = d_curr[y];
-                    const double* d_yp1 = d_curr[y + 1];
+                    DogSlice slice = {
+                        d_curr[y - 1], d_curr[y], d_curr[y + 1],
+                        d_prev[y - 1], d_prev[y], d_prev[y + 1],
+                        d_next[y - 1], d_next[y], d_next[y + 1]
+                    };
+                    const double* d_ym1 = slice.r0;
+                    const double* d_y0  = slice.r1;
+                    const double* d_yp1 = slice.r2;
                     for (int x = 1; x < oct.width - 1; x++) {
                         double v = d_y0[x];
                         if (std::fabs(v) < CONTRAST_THRESH) continue;
-                        if (!isExtremum(v, d_prev, d_next, d_ym1, d_y0, d_yp1, x, y)) continue;
+                        if (!isExtremum(v, slice, x)) continue;
                         if (!passesEdgeTest(d_ym1, d_y0, d_yp1, x)) continue;
 
                         Keypoint kp;
@@ -733,21 +830,33 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    Mat grayA, grayB;
-    int heightA = 0, widthA = 0;
-    int heightB = 0, widthB = 0;
+    init_lut();
+    init_gaussian_kernels();
+
+    RawImage rawA, rawB;
 
     #pragma omp parallel sections
     {
         #pragma omp section
         {
-            read_png_to_gray(argv[1], grayA, heightA, widthA);
+            read_png_raw(argv[1], rawA);
         }
         #pragma omp section
         {
-            read_png_to_gray(argv[2], grayB, heightB, widthB);
+            read_png_raw(argv[2], rawB);
         }
     }
+
+    Mat grayA, grayB;
+    int heightA = rawA.height, widthA = rawA.width;
+    int heightB = rawB.height, widthB = rawB.width;
+
+    raw_to_gray(rawA, grayA);
+    free(rawA.raw_buf); rawA.raw_buf = nullptr;
+
+    raw_to_gray(rawB, grayB);
+    free(rawB.raw_buf); rawB.raw_buf = nullptr;
+
     auto t_read = std::chrono::high_resolution_clock::now();
 
     BufferPool pool;
