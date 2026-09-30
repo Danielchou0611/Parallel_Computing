@@ -109,15 +109,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // (N+2)^3 with a halo of zeros around the block, so no cell is a special case.
+    // (N+2)^3 with a halo of zeros around the block, padded to 64-byte boundary.
     const long M = N + 2;
-    const long SI = M * M, SJ = M;  // strides of i and j; k is contiguous
-    std::vector<double> u(M * M * M, 0.0), unew(M * M * M, 0.0), a(M * M * M, 0.0);
+    const long SJ = (M + 7) & ~7L;  // 64-byte aligned stride (multiple of 8 doubles)
+    const long SI = M * SJ;
+    std::vector<double> u(M * SI, 0.0), unew(M * SI, 0.0), a(M * SI, 0.0);
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
     double energy0 = 0.0;
-#pragma omp parallel for schedule(static) reduction(+:energy0)
+#pragma omp parallel for schedule(static, 4) reduction(+:energy0)
     for (long i = 1; i <= N; i++) {
         for (long j = 1; j <= N; j++) {
             for (long k = 1; k <= N; k++) {
@@ -139,7 +140,7 @@ int main(int argc, char** argv) {
 #pragma omp parallel
     {
         while (steps < T) {
-#pragma omp for schedule(static) reduction(+:step_energy)
+#pragma omp for schedule(static, 4) reduction(+:step_energy)
             for (long i = 1; i <= N; i++) {
                 bool slice_has_sphere = false;
                 for (int b = 0; b < B; b++) {
