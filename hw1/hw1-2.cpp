@@ -11,6 +11,7 @@
 #include <memory>
 #include <omp.h>
 #include <cstring>
+#include <immintrin.h>
 
 // ---------- shared PNG I/O ----------
 
@@ -191,92 +192,108 @@ void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tm
 
     int K = 2 * radius + 1;
     const double* k_ptr = kernel.data();
-
-    // Pass 1: Horizontal blur with boundary splitting (vectorized middle)
-    #pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        const double* in_row = in[y];
-        double* tmp_row = tmp_buf + y * width;
-
-        int left_end = std::min(radius, width);
-        for (int x = 0; x < left_end; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int xx = std::min(std::max(x + i, 0), width - 1);
-                acc += in_row[xx] * k_ptr[i + radius];
-            }
-            tmp_row[x] = acc;
-        }
-
-        int right_start = std::max(radius, width - radius);
-        for (int x = left_end; x < right_start; x++) {
-            double acc = 0.0;
-            const double* p = in_row + (x - radius);
-            #pragma GCC ivdep
-            for (int i = 0; i < K; i++) {
-                acc += p[i] * k_ptr[i];
-            }
-            tmp_row[x] = acc;
-        }
-
-        for (int x = right_start; x < width; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int xx = std::min(std::max(x + i, 0), width - 1);
-                acc += in_row[xx] * k_ptr[i + radius];
-            }
-            tmp_row[x] = acc;
-        }
+    __m256d k_vecs[45];
+    for (int i = 0; i < K; i++) {
+        k_vecs[i] = _mm256_set1_pd(k_ptr[i]);
     }
 
-    // Pass 2: Vertical blur (4-tap contiguous row accumulation)
-    #pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        double* out_row = out[y];
+    #pragma omp parallel
+    {
+        // Pass 1: Horizontal blur with boundary splitting (AVX2 4-pixel vectorized middle)
+        #pragma omp for schedule(static)
+        for (int y = 0; y < height; y++) {
+            const double* in_row = in[y];
+            double* tmp_row = tmp_buf + y * width;
 
-        const double* rows[45];
-        double ks[45];
-        for (int i = -radius; i <= radius; i++) {
-            int yy = std::min(std::max(y + i, 0), height - 1);
-            rows[i + radius] = tmp_buf + yy * width;
-            ks[i + radius] = k_ptr[i + radius];
+            int left_end = std::min(radius, width);
+            for (int x = 0; x < left_end; x++) {
+                double acc = 0.0;
+                for (int i = -radius; i <= radius; i++) {
+                    int xx = std::min(std::max(x + i, 0), width - 1);
+                    acc += in_row[xx] * k_ptr[i + radius];
+                }
+                tmp_row[x] = acc;
+            }
+
+            int right_start = std::max(radius, width - radius);
+            int x = left_end;
+            for (; x + 3 < right_start; x += 4) {
+                __m256d acc = _mm256_setzero_pd();
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    __m256d p_vec = _mm256_loadu_pd(p + i);
+                    acc = _mm256_add_pd(acc, _mm256_mul_pd(p_vec, k_vecs[i]));
+                }
+                _mm256_storeu_pd(tmp_row + x, acc);
+            }
+            for (; x < right_start; x++) {
+                double acc = 0.0;
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    acc += p[i] * k_ptr[i];
+                }
+                tmp_row[x] = acc;
+            }
+
+            for (int x = right_start; x < width; x++) {
+                double acc = 0.0;
+                for (int i = -radius; i <= radius; i++) {
+                    int xx = std::min(std::max(x + i, 0), width - 1);
+                    acc += in_row[xx] * k_ptr[i + radius];
+                }
+                tmp_row[x] = acc;
+            }
         }
 
-        int t = 0;
-        if (K >= 4) {
-            const double* r0 = rows[0]; double c0 = ks[0];
-            const double* r1 = rows[1]; double c1 = ks[1];
-            const double* r2 = rows[2]; double c2 = ks[2];
-            const double* r3 = rows[3]; double c3 = ks[3];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] = (r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3);
+        // Pass 2: Vertical blur (4-tap contiguous row accumulation)
+        #pragma omp for schedule(static)
+        for (int y = 0; y < height; y++) {
+            double* out_row = out[y];
+
+            const double* rows[45];
+            double ks[45];
+            for (int i = -radius; i <= radius; i++) {
+                int yy = std::min(std::max(y + i, 0), height - 1);
+                rows[i + radius] = tmp_buf + yy * width;
+                ks[i + radius] = k_ptr[i + radius];
             }
-            t = 4;
-            for (; t + 3 < K; t += 4) {
-                const double* ra = rows[t + 0]; double ca = ks[t + 0];
-                const double* rb = rows[t + 1]; double cb = ks[t + 1];
-                const double* rc = rows[t + 2]; double cc = ks[t + 2];
-                const double* rd = rows[t + 3]; double cd = ks[t + 3];
+
+            int t = 0;
+            if (K >= 4) {
+                const double* r0 = rows[0]; double c0 = ks[0];
+                const double* r1 = rows[1]; double c1 = ks[1];
+                const double* r2 = rows[2]; double c2 = ks[2];
+                const double* r3 = rows[3]; double c3 = ks[3];
                 #pragma GCC ivdep
                 for (int x = 0; x < width; x++) {
-                    out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
+                    out_row[x] = (r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3);
                 }
+                t = 4;
+                for (; t + 3 < K; t += 4) {
+                    const double* ra = rows[t + 0]; double ca = ks[t + 0];
+                    const double* rb = rows[t + 1]; double cb = ks[t + 1];
+                    const double* rc = rows[t + 2]; double cc = ks[t + 2];
+                    const double* rd = rows[t + 3]; double cd = ks[t + 3];
+                    #pragma GCC ivdep
+                    for (int x = 0; x < width; x++) {
+                        out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
+                    }
+                }
+            } else {
+                const double* r0 = rows[0]; double c0 = ks[0];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] = r0[x] * c0;
+                }
+                t = 1;
             }
-        } else {
-            const double* r0 = rows[0]; double c0 = ks[0];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] = r0[x] * c0;
-            }
-            t = 1;
-        }
 
-        for (; t < K; t++) {
-            const double* r = rows[t]; double c = ks[t];
-            #pragma GCC ivdep
-            for (int x = 0; x < width; x++) {
-                out_row[x] += r[x] * c;
+            for (; t < K; t++) {
+                const double* r = rows[t]; double c = ks[t];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] += r[x] * c;
+                }
             }
         }
     }
@@ -377,15 +394,12 @@ struct Keypoint {
     std::vector<double> descriptor;
 };
 
-inline bool isExtremum(const std::vector<Mat>& dog, int s, int x, int y) {
-    double v = dog[s][y][x];
+inline bool isExtremum(double v, const Mat& d_prev, const Mat& d_next,
+                       const double* r0, const double* r1, const double* r2,
+                       int x, int y) {
     bool isMax = true, isMin = true;
 
     // Check same layer first (cache hot, eliminates >95% of non-extrema immediately)
-    const double* r0 = dog[s][y - 1];
-    const double* r1 = dog[s][y];
-    const double* r2 = dog[s][y + 1];
-
     double n;
     #define CHK(val) do { n = (val); if (n >= v) isMax = false; if (n <= v) isMin = false; if (!isMax && !isMin) return false; } while(0)
     CHK(r0[x - 1]); CHK(r0[x]); CHK(r0[x + 1]);
@@ -393,17 +407,17 @@ inline bool isExtremum(const std::vector<Mat>& dog, int s, int x, int y) {
     CHK(r2[x - 1]); CHK(r2[x]); CHK(r2[x + 1]);
 
     // Check layer s - 1
-    const double* p0 = dog[s - 1][y - 1];
-    const double* p1 = dog[s - 1][y];
-    const double* p2 = dog[s - 1][y + 1];
+    const double* p0 = d_prev[y - 1];
+    const double* p1 = d_prev[y];
+    const double* p2 = d_prev[y + 1];
     CHK(p0[x - 1]); CHK(p0[x]); CHK(p0[x + 1]);
     CHK(p1[x - 1]); CHK(p1[x]); CHK(p1[x + 1]);
     CHK(p2[x - 1]); CHK(p2[x]); CHK(p2[x + 1]);
 
     // Check layer s + 1
-    const double* q0 = dog[s + 1][y - 1];
-    const double* q1 = dog[s + 1][y];
-    const double* q2 = dog[s + 1][y + 1];
+    const double* q0 = d_next[y - 1];
+    const double* q1 = d_next[y];
+    const double* q2 = d_next[y + 1];
     CHK(q0[x - 1]); CHK(q0[x]); CHK(q0[x + 1]);
     CHK(q1[x - 1]); CHK(q1[x]); CHK(q1[x + 1]);
     CHK(q2[x - 1]); CHK(q2[x]); CHK(q2[x + 1]);
@@ -428,23 +442,29 @@ inline bool passesEdgeTest(const double* ym1, const double* y0, const double* yp
 std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
     std::vector<Keypoint> keypoints;
     int max_threads = omp_get_max_threads();
+    std::vector<std::vector<Keypoint>> thread_kps(max_threads);
 
     for (int o = 0; o < NUM_OCTAVES; o++) {
         const Octave& oct = octaves[o];
         for (int s = 1; s < (int)oct.dog.size() - 1; s++) {
-            std::vector<std::vector<Keypoint>> thread_kps(max_threads);
+            for (int t = 0; t < max_threads; t++) thread_kps[t].clear();
+            const Mat& d_prev = oct.dog[s - 1];
+            const Mat& d_curr = oct.dog[s];
+            const Mat& d_next = oct.dog[s + 1];
+            double scale = SIGMA0 * std::pow(2.0, (double)s / S);
 
             #pragma omp parallel
             {
                 int tid = omp_get_thread_num();
                 #pragma omp for schedule(static)
                 for (int y = 1; y < oct.height - 1; y++) {
-                    const double* d_ym1 = oct.dog[s][y - 1];
-                    const double* d_y0  = oct.dog[s][y];
-                    const double* d_yp1 = oct.dog[s][y + 1];
+                    const double* d_ym1 = d_curr[y - 1];
+                    const double* d_y0  = d_curr[y];
+                    const double* d_yp1 = d_curr[y + 1];
                     for (int x = 1; x < oct.width - 1; x++) {
-                        if (std::fabs(d_y0[x]) < CONTRAST_THRESH) continue;
-                        if (!isExtremum(oct.dog, s, x, y)) continue;
+                        double v = d_y0[x];
+                        if (std::fabs(v) < CONTRAST_THRESH) continue;
+                        if (!isExtremum(v, d_prev, d_next, d_ym1, d_y0, d_yp1, x, y)) continue;
                         if (!passesEdgeTest(d_ym1, d_y0, d_yp1, x)) continue;
 
                         Keypoint kp;
@@ -452,7 +472,7 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
                         kp.layer = s;
                         kp.x = x;
                         kp.y = y;
-                        kp.scale = SIGMA0 * std::pow(2.0, (double)s / S);
+                        kp.scale = scale;
                         thread_kps[tid].push_back(kp);
                     }
                 }
