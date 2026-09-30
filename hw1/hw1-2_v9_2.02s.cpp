@@ -12,8 +12,6 @@
 #include <omp.h>
 #include <cstring>
 #include <immintrin.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 // ---------- shared PNG I/O ----------
 
@@ -44,9 +42,7 @@ struct BufferPool {
         size_t cap = 0;
         Buffer() = default;
         Buffer(size_t n) {
-            if (posix_memalign((void**)&ptr, 64, n * sizeof(double)) != 0) {
-                ptr = (double*)malloc(n * sizeof(double));
-            }
+            ptr = (double*)malloc(n * sizeof(double));
             cap = n;
         }
         ~Buffer() { if (ptr) free(ptr); }
@@ -64,10 +60,7 @@ struct BufferPool {
 
         void ensure(size_t n) {
             if (cap < n) {
-                if (ptr) free(ptr);
-                if (posix_memalign((void**)&ptr, 64, n * sizeof(double)) != 0) {
-                    ptr = (double*)malloc(n * sizeof(double));
-                }
+                ptr = (double*)realloc(ptr, n * sizeof(double));
                 cap = n;
             }
         }
@@ -112,8 +105,6 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
         exit(EXIT_FAILURE);
     }
-    posix_fadvise(fileno(fp), 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
-    setvbuf(fp, nullptr, _IOFBF, 2 * 1024 * 1024);
 
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     png_infop info = png_create_info_struct(png);
@@ -220,6 +211,168 @@ static void init_gaussian_kernels() {
     s_kernels_inited = true;
 }
 
+// Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
+void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk, double* tmp_buf, Mat& out,
+                  const double* prev_g = nullptr, double* out_dog = nullptr) {
+    int radius = gk.radius;
+    int K = gk.K;
+    const double* k_ptr = gk.kernel;
+    const __m256d* k_vecs = gk.k_vecs;
+
+    #pragma omp parallel
+    {
+        // Pass 1: Horizontal blur with boundary splitting (AVX2 4-pixel vectorized middle)
+        #pragma omp for schedule(static)
+        for (int y = 0; y < height; y++) {
+            const double* in_row = in[y];
+            double* tmp_row = tmp_buf + y * width;
+
+            int left_end = std::min(radius, width);
+            for (int x = 0; x < left_end; x++) {
+                double acc = 0.0;
+                for (int i = -radius; i <= radius; i++) {
+                    int xx = std::min(std::max(x + i, 0), width - 1);
+                    acc += in_row[xx] * k_ptr[i + radius];
+                }
+                tmp_row[x] = acc;
+            }
+
+            int right_start = std::max(radius, width - radius);
+            int x = left_end;
+            for (; x + 7 < right_start; x += 8) {
+                __m256d acc0 = _mm256_setzero_pd();
+                __m256d acc1 = _mm256_setzero_pd();
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    __m256d kv = k_vecs[i];
+                    __m256d p0 = _mm256_loadu_pd(p + i);
+                    __m256d p1 = _mm256_loadu_pd(p + i + 4);
+                    acc0 = _mm256_add_pd(acc0, _mm256_mul_pd(p0, kv));
+                    acc1 = _mm256_add_pd(acc1, _mm256_mul_pd(p1, kv));
+                }
+                _mm256_storeu_pd(tmp_row + x, acc0);
+                _mm256_storeu_pd(tmp_row + x + 4, acc1);
+            }
+            for (; x + 3 < right_start; x += 4) {
+                __m256d acc = _mm256_setzero_pd();
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    __m256d p_vec = _mm256_loadu_pd(p + i);
+                    acc = _mm256_add_pd(acc, _mm256_mul_pd(p_vec, k_vecs[i]));
+                }
+                _mm256_storeu_pd(tmp_row + x, acc);
+            }
+            for (; x < right_start; x++) {
+                double acc = 0.0;
+                const double* p = in_row + (x - radius);
+                for (int i = 0; i < K; i++) {
+                    acc += p[i] * k_ptr[i];
+                }
+                tmp_row[x] = acc;
+            }
+
+            for (int x = right_start; x < width; x++) {
+                double acc = 0.0;
+                for (int i = -radius; i <= radius; i++) {
+                    int xx = std::min(std::max(x + i, 0), width - 1);
+                    acc += in_row[xx] * k_ptr[i + radius];
+                }
+                tmp_row[x] = acc;
+            }
+        }
+
+        // Pass 2: Vertical blur (8-tap contiguous row accumulation) + Fused DoG
+        #pragma omp for schedule(static)
+        for (int y = 0; y < height; y++) {
+            double* out_row = out[y];
+
+            const double* rows[45];
+            for (int i = -radius; i <= radius; i++) {
+                int yy = std::min(std::max(y + i, 0), height - 1);
+                rows[i + radius] = tmp_buf + yy * width;
+            }
+
+            int t = 0;
+            if (K >= 8) {
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
+                const double* r1 = rows[1]; double c1 = k_ptr[1];
+                const double* r2 = rows[2]; double c2 = k_ptr[2];
+                const double* r3 = rows[3]; double c3 = k_ptr[3];
+                const double* r4 = rows[4]; double c4 = k_ptr[4];
+                const double* r5 = rows[5]; double c5 = k_ptr[5];
+                const double* r6 = rows[6]; double c6 = k_ptr[6];
+                const double* r7 = rows[7]; double c7 = k_ptr[7];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] = ((r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3)) +
+                                 ((r4[x] * c4 + r5[x] * c5) + (r6[x] * c6 + r7[x] * c7));
+                }
+                t = 8;
+                for (; t + 7 < K; t += 8) {
+                    const double* ra = rows[t + 0]; double ca = k_ptr[t + 0];
+                    const double* rb = rows[t + 1]; double cb = k_ptr[t + 1];
+                    const double* rc = rows[t + 2]; double cc = k_ptr[t + 2];
+                    const double* rd = rows[t + 3]; double cd = k_ptr[t + 3];
+                    const double* re = rows[t + 4]; double ce = k_ptr[t + 4];
+                    const double* rf = rows[t + 5]; double cf = k_ptr[t + 5];
+                    const double* rg = rows[t + 6]; double cg = k_ptr[t + 6];
+                    const double* rh = rows[t + 7]; double ch = k_ptr[t + 7];
+                    #pragma GCC ivdep
+                    for (int x = 0; x < width; x++) {
+                        out_row[x] += ((ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd)) +
+                                      ((re[x] * ce + rf[x] * cf) + (rg[x] * cg + rh[x] * ch));
+                    }
+                }
+            } else if (K >= 4) {
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
+                const double* r1 = rows[1]; double c1 = k_ptr[1];
+                const double* r2 = rows[2]; double c2 = k_ptr[2];
+                const double* r3 = rows[3]; double c3 = k_ptr[3];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] = (r0[x] * c0 + r1[x] * c1) + (r2[x] * c2 + r3[x] * c3);
+                }
+                t = 4;
+            } else {
+                const double* r0 = rows[0]; double c0 = k_ptr[0];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] = r0[x] * c0;
+                }
+                t = 1;
+            }
+
+            for (; t + 3 < K; t += 4) {
+                const double* ra = rows[t + 0]; double ca = k_ptr[t + 0];
+                const double* rb = rows[t + 1]; double cb = k_ptr[t + 1];
+                const double* rc = rows[t + 2]; double cc = k_ptr[t + 2];
+                const double* rd = rows[t + 3]; double cd = k_ptr[t + 3];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] += (ra[x] * ca + rb[x] * cb) + (rc[x] * cc + rd[x] * cd);
+                }
+            }
+
+            for (; t < K; t++) {
+                const double* r = rows[t]; double c = k_ptr[t];
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    out_row[x] += r[x] * c;
+                }
+            }
+
+            if (out_dog && prev_g) {
+                const double* prev_row = prev_g + y * width;
+                double* dog_row = out_dog + y * width;
+                #pragma GCC ivdep
+                for (int x = 0; x < width; x++) {
+                    dog_row[x] = out_row[x] - prev_row[x];
+                }
+            }
+        }
+    }
+}
+
 void downsample2x(const Mat& in, int height, int width, Mat& out) {
     int nh = height / 2, nw = width / 2;
     #pragma omp parallel for
@@ -237,127 +390,6 @@ struct Octave {
     std::vector<Mat> gaussian; // NUM_SCALES images
     std::vector<Mat> dog;      // NUM_SCALES - 1 images
 };
-
-template<int RADIUS, int K>
-inline void runScale(int s, const double* in_mat, double* out_mat, const double* prev_g, double* out_dog, double* tmp_buf, int h, int w) {
-    const GaussianKernel& gk = s_kernels[s];
-    const double* k_ptr = gk.kernel;
-    const __m256d* k_vecs = gk.k_vecs;
-
-    // Pass 1: Horizontal blur with boundary splitting (AVX2 dual-accumulator 8-pixel middle)
-    #pragma omp for schedule(static)
-    for (int y = 0; y < h; y++) {
-        const double* in_row = in_mat + y * w;
-        double* tmp_row = tmp_buf + y * w;
-
-        int left_end = std::min(RADIUS, w);
-        for (int x = 0; x < left_end; x++) {
-            double acc = 0.0;
-            for (int i = -RADIUS; i <= RADIUS; i++) {
-                int xx = std::min(std::max(x + i, 0), w - 1);
-                acc += in_row[xx] * k_ptr[i + RADIUS];
-            }
-            tmp_row[x] = acc;
-        }
-
-        int right_start = std::max(RADIUS, w - RADIUS);
-        int x = left_end;
-        for (; x + 7 < right_start; x += 8) {
-            __m256d acc0 = _mm256_setzero_pd();
-            __m256d acc1 = _mm256_setzero_pd();
-            const double* p = in_row + (x - RADIUS);
-            #pragma GCC unroll 8
-            for (int i = 0; i < K; i++) {
-                __m256d kv = k_vecs[i];
-                __m256d p0 = _mm256_loadu_pd(p + i);
-                __m256d p1 = _mm256_loadu_pd(p + i + 4);
-                acc0 = _mm256_add_pd(acc0, _mm256_mul_pd(p0, kv));
-                acc1 = _mm256_add_pd(acc1, _mm256_mul_pd(p1, kv));
-            }
-            _mm256_storeu_pd(tmp_row + x, acc0);
-            _mm256_storeu_pd(tmp_row + x + 4, acc1);
-        }
-        for (; x + 3 < right_start; x += 4) {
-            __m256d acc = _mm256_setzero_pd();
-            const double* p = in_row + (x - RADIUS);
-            for (int i = 0; i < K; i++) {
-                __m256d p_vec = _mm256_loadu_pd(p + i);
-                acc = _mm256_add_pd(acc, _mm256_mul_pd(p_vec, k_vecs[i]));
-            }
-            _mm256_storeu_pd(tmp_row + x, acc);
-        }
-        for (; x < right_start; x++) {
-            double acc = 0.0;
-            const double* p = in_row + (x - RADIUS);
-            for (int i = 0; i < K; i++) {
-                acc += p[i] * k_ptr[i];
-            }
-            tmp_row[x] = acc;
-        }
-
-        for (int x = right_start; x < w; x++) {
-            double acc = 0.0;
-            for (int i = -RADIUS; i <= RADIUS; i++) {
-                int xx = std::min(std::max(x + i, 0), w - 1);
-                acc += in_row[xx] * k_ptr[i + RADIUS];
-            }
-            tmp_row[x] = acc;
-        }
-    }
-
-    // Pass 2: Vertical blur (AVX2 dual-accumulator 8-pixel column-vectorized) + Fused DoG
-    #pragma omp for schedule(static)
-    for (int y = 0; y < h; y++) {
-        double* out_row = out_mat + y * w;
-
-        const double* rows[45];
-        for (int i = -RADIUS; i <= RADIUS; i++) {
-            int yy = std::min(std::max(y + i, 0), h - 1);
-            rows[i + RADIUS] = tmp_buf + yy * w;
-        }
-
-        const double* prev_row = prev_g + y * w;
-        double* dog_row = out_dog + y * w;
-
-        int x = 0;
-        for (; x + 7 < w; x += 8) {
-            __m256d acc0 = _mm256_setzero_pd();
-            __m256d acc1 = _mm256_setzero_pd();
-            #pragma GCC unroll 8
-            for (int i = 0; i < K; i++) {
-                __m256d kv = k_vecs[i];
-                __m256d r0 = _mm256_loadu_pd(rows[i] + x);
-                __m256d r1 = _mm256_loadu_pd(rows[i] + x + 4);
-                acc0 = _mm256_add_pd(acc0, _mm256_mul_pd(r0, kv));
-                acc1 = _mm256_add_pd(acc1, _mm256_mul_pd(r1, kv));
-            }
-            _mm256_storeu_pd(out_row + x, acc0);
-            _mm256_storeu_pd(out_row + x + 4, acc1);
-            __m256d p0 = _mm256_loadu_pd(prev_row + x);
-            __m256d p1 = _mm256_loadu_pd(prev_row + x + 4);
-            _mm256_storeu_pd(dog_row + x, _mm256_sub_pd(acc0, p0));
-            _mm256_storeu_pd(dog_row + x + 4, _mm256_sub_pd(acc1, p1));
-        }
-        for (; x + 3 < w; x += 4) {
-            __m256d acc = _mm256_setzero_pd();
-            for (int i = 0; i < K; i++) {
-                __m256d r = _mm256_loadu_pd(rows[i] + x);
-                acc = _mm256_add_pd(acc, _mm256_mul_pd(r, k_vecs[i]));
-            }
-            _mm256_storeu_pd(out_row + x, acc);
-            __m256d p = _mm256_loadu_pd(prev_row + x);
-            _mm256_storeu_pd(dog_row + x, _mm256_sub_pd(acc, p));
-        }
-        for (; x < w; x++) {
-            double acc = 0.0;
-            for (int i = 0; i < K; i++) {
-                acc += rows[i][x] * k_ptr[i];
-            }
-            out_row[x] = acc;
-            dog_row[x] = acc - prev_row[x];
-        }
-    }
-}
 
 std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferPool& pool) {
     init_gaussian_kernels();
@@ -377,18 +409,12 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferP
         for (int s = 0; s < NUM_SCALES - 1; s++) {
             oct.dog[s] = pool.allocMat(h, w);
         }
+        auto t_o0 = std::chrono::high_resolution_clock::now();
         for (int s = 1; s < NUM_SCALES; s++) {
             oct.gaussian[s] = pool.allocMat(h, w);
-        }
-        auto t_o0 = std::chrono::high_resolution_clock::now();
-
-        #pragma omp parallel
-        {
-            runScale<7, 15>(1, base.data_ptr(), oct.gaussian[1].data_ptr(), oct.gaussian[0].data_ptr(), oct.dog[0].data_ptr(), tmp_buf, h, w);
-            runScale<8, 17>(2, base.data_ptr(), oct.gaussian[2].data_ptr(), oct.gaussian[1].data_ptr(), oct.dog[1].data_ptr(), tmp_buf, h, w);
-            runScale<10, 21>(3, base.data_ptr(), oct.gaussian[3].data_ptr(), oct.gaussian[2].data_ptr(), oct.dog[2].data_ptr(), tmp_buf, h, w);
-            runScale<13, 27>(4, base.data_ptr(), oct.gaussian[4].data_ptr(), oct.gaussian[3].data_ptr(), oct.dog[3].data_ptr(), tmp_buf, h, w);
-            runScale<16, 33>(5, base.data_ptr(), oct.gaussian[5].data_ptr(), oct.gaussian[4].data_ptr(), oct.dog[4].data_ptr(), tmp_buf, h, w);
+            const double* prev_g = oct.gaussian[s - 1].data_ptr();
+            double* out_dog = oct.dog[s - 1].data_ptr();
+            gaussianBlur(base, h, w, s_kernels[s], tmp_buf, oct.gaussian[s], prev_g, out_dog);
         }
         auto t_o1 = std::chrono::high_resolution_clock::now();
         if (getenv("PROFILE")) {
@@ -469,8 +495,6 @@ inline bool isExtremum(double v, const DogSlice& sl, int x) {
     }
 }
 
-static const double EDGE_RATIO_THRESH = (EDGE_THRESH_R + 1.0) * (EDGE_THRESH_R + 1.0) / EDGE_THRESH_R;
-
 inline bool passesEdgeTest(const double* ym1, const double* y0, const double* yp1, int x) {
     double dxx = y0[x + 1] + y0[x - 1] - 2 * y0[x];
     double dyy = yp1[x] + ym1[x] - 2 * y0[x];
@@ -478,7 +502,8 @@ inline bool passesEdgeTest(const double* ym1, const double* y0, const double* yp
     double trace = dxx + dyy;
     double det = dxx * dyy - dxy * dxy;
     if (det <= 0) return false;
-    return (trace * trace) < EDGE_RATIO_THRESH * det;
+    double ratio = (trace * trace) / det;
+    return ratio < (EDGE_THRESH_R + 1) * (EDGE_THRESH_R + 1) / EDGE_THRESH_R;
 }
 
 // Independent per (octave, layer, pixel) -- another natural parallelization
@@ -683,22 +708,25 @@ struct Match {
     double distance;
 };
 
-inline double descriptorDistSqEarly(const double* a, const double* b, double second_sq) {
+inline double descriptorDistSq(const double* a, const double* b) {
     double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-    for (int i = 0; i < 128; i += 32) {
-        for (int k = i; k < i + 32; k += 8) {
-            double d0 = a[k+0] - b[k+0];
-            double d1 = a[k+1] - b[k+1];
-            double d2 = a[k+2] - b[k+2];
-            double d3 = a[k+3] - b[k+3];
-            double d4 = a[k+4] - b[k+4];
-            double d5 = a[k+5] - b[k+5];
-            double d6 = a[k+6] - b[k+6];
-            double d7 = a[k+7] - b[k+7];
-            s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
-            s0 += d4 * d4; s1 += d5 * d5; s2 += d6 * d6; s3 += d7 * d7;
-        }
-        if ((s0 + s1) + (s2 + s3) >= second_sq) return (s0 + s1) + (s2 + s3);
+    for (int i = 0; i < 128; i += 8) {
+        double d0 = a[i+0] - b[i+0];
+        double d1 = a[i+1] - b[i+1];
+        double d2 = a[i+2] - b[i+2];
+        double d3 = a[i+3] - b[i+3];
+        double d4 = a[i+4] - b[i+4];
+        double d5 = a[i+5] - b[i+5];
+        double d6 = a[i+6] - b[i+6];
+        double d7 = a[i+7] - b[i+7];
+        s0 += d0 * d0;
+        s1 += d1 * d1;
+        s2 += d2 * d2;
+        s3 += d3 * d3;
+        s0 += d4 * d4;
+        s1 += d5 * d5;
+        s2 += d6 * d6;
+        s3 += d7 * d7;
     }
     return (s0 + s1) + (s2 + s3);
 }
@@ -727,7 +755,7 @@ std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
 
         for (size_t j = 0; j < numB; j++) {
             const double* descB = b_ptr + j * 128;
-            double d_sq = descriptorDistSqEarly(descA, descB, second_sq);
+            double d_sq = descriptorDistSq(descA, descB);
             if (d_sq < best_sq) {
                 second_sq = best_sq;
                 best_sq = d_sq;
@@ -755,8 +783,6 @@ std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
 void writeOutput(const char* path, const FeatureSet& a, const FeatureSet& b,
                   const std::vector<Match>& matches) {
     std::ofstream out(path);
-    char out_buf[1024 * 1024];
-    out.rdbuf()->pubsetbuf(out_buf, sizeof(out_buf));
 
     out << "KEYPOINTS_A " << a.keypoints.size() << "\n";
     for (const auto& kp : a.keypoints) {

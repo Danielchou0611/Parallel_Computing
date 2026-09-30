@@ -11,11 +11,56 @@
 | 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | ~12.42x |
 | 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | ~15.15x |
 | 7 | 2026-09-30 11:22 | hw1-2 | AVX2 4-pixel horizontal blur with pre-broadcast k_vecs, fused parallel region in gaussianBlur, preallocated thread_kps, zero-redundancy extremum checking | 2.13 | 16/16 AC | ~18.78x |
-| 8 | 2026-09-30 12:40 | hw1-2 | Precomputed static Gaussian kernels, decoupled full-team multithreaded grayscale, 8-tap vertical blur row accumulation, DogSlice extremum branching, dual-accumulator AVX2 horizontal blur | 2.04 | 16/16 AC | **~19.61x** 🚀 |
+| 8 | 2026-09-30 12:40 | hw1-2 | Precomputed static Gaussian kernels, decoupled full-team multithreaded grayscale, 8-tap vertical blur row accumulation, DogSlice extremum branching, dual-accumulator AVX2 horizontal blur | 2.04 | 16/16 AC | ~19.61x |
+| 9 | 2026-09-30 13:10 | hw1-2 | Fused DoG in vertical blur Pass 2, streaming row-by-row PNG decode, single outer parallel region in detectKeypoints | 2.02 | 16/16 AC | **~19.80x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #9: Fused DoG in Pass 2, Streaming PNG Decode, Outer Parallel DetectKeypoints
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 13:10
+- **Total Time**: 2.02s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~19.80x (vs v8: **1.010x faster**)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Backup File**: `hw1-2_v9_2.02s.cpp`
+- **Key Modifications**:
+  1. **Pass 2 垂直濾波融合 DoG（Fused DoG in Pass 2）**：在 Pass 2 寫入 `out_row` 的同時，直接從快取讀取並計算 `dog_row[x] = out_row[x] - prev_row[x]`，省去整張影像的二次遍歷與 ~590MB DRAM 讀寫頻寬。
+  2. **串流式 PNG 解碼與灰階轉換（Streaming PNG Decode）**：利用 `png_read_row` 邊解碼邊轉灰階，減少大圖記憶體暫存峰值。
+  3. **`detectKeypoints` 單一平行區間（Outer Parallel Region）**：將所有尺度整合至單一 `#pragma omp parallel`，消除重複 Fork-Join 開銷。
+  4. **最佳成績**：
+     - `a04`: 0.07s ➔ **0.06s** ↓
+     - `a06`: 0.11s ➔ **0.10s** ↓
+     - `a07`: 0.24s ➔ **0.22s** ↓
+     - `b02`: 0.03s ➔ **0.02s** ↓
+     - `b05`: 0.07s ➔ **0.06s** ↓
+     - `b07`: 0.33s ➔ **0.30s** ↓
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.02 ↓
+  a02  AC      0.03 0.02 ↑
+  a03  AC      0.04 0.04 ↓
+  a04  AC      0.06 0.07 ↓
+  a05  AC      0.09 0.08 ↑
+  a06  AC      0.10 0.11 ↓
+  a07  AC      0.22 0.24 ↓
+  a08  AC      0.33 0.33 ↓
+  b01  AC      0.02 0.02 ↓
+  b02  AC      0.02 0.03 ↓
+  b03  AC      0.03 0.03 ↑
+  b04  AC      0.06 0.05 ↑
+  b05  AC      0.06 0.07 ↓
+  b06  AC      0.21 0.20 ↑
+  b07  AC      0.30 0.33 ↓
+  b08  AC      0.42 0.40 ↑
+──────────────────────────
+Total: 16/16   2.02 2.04 ↓
+```
+
+---
 
 ### Run #8: Precomputed Kernels, 8-Tap Vertical Accumulation, DogSlice Branching & Dual-Acc AVX2
 - **Target**: `hw1-2`
