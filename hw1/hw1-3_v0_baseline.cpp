@@ -36,7 +36,6 @@ initial energy or less.
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-#include <omp.h>
 
 // ========== START: DO NOT CHANGE BELOW ==========
 static const double R = 0.5;    // the reaction's strength
@@ -113,63 +112,55 @@ int main(int argc, char** argv) {
     const long M = N + 2;
     const long SI = M * M, SJ = M;  // strides of i and j; k is contiguous
     std::vector<double> u(M * M * M, 0.0), unew(M * M * M, 0.0), a(M * M * M, 0.0);
+    std::vector<uint8_t> mat(M * M * M, 0);  // 1 where the cell is reactive
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
-    double energy0 = 0.0;
-#pragma omp parallel for schedule(static) reduction(+:energy0)
-    for (long i = 1; i <= N; i++) {
-        for (long j = 1; j <= N; j++) {
+    for (long i = 1; i <= N; i++)
+        for (long j = 1; j <= N; j++)
             for (long k = 1; k <= N; k++) {
                 const long p = i * SI + j * SJ + k;
                 const uint64_t index = ((i - 1) * N + (j - 1)) * N + (k - 1);
-                const double u_val = field(seed, index, 0);
-                u[p] = u_val;
+                u[p] = field(seed, index, 0);
                 a[p] = field(seed, index, 1);
-                energy0 += u_val * u_val;
+                mat[p] = reactive(inc, B, i, j, k);
             }
-        }
-    }
 
+    // The energy of the block: the sum of u^2 over its cells.
+    auto energy_of = [&](const std::vector<double>& v) {
+        double energy = 0.0;
+        for (long i = 1; i <= N; i++)
+            for (long j = 1; j <= N; j++)
+                for (long k = 1; k <= N; k++) {
+                    const double x = v[i * SI + j * SJ + k];
+                    energy += x * x;
+                }
+        return energy;
+    };
+
+    const double energy0 = energy_of(u);
     double energy = energy0;
     int steps = 0;
-    const double threshold = theta * energy0;
-    double step_energy = 0.0;
-
-#pragma omp parallel
-    {
-        while (steps < T) {
-#pragma omp for schedule(static) reduction(+:step_energy)
-            for (long i = 1; i <= N; i++) {
-                for (long j = 1; j <= N; j++) {
-                    for (long k = 1; k <= N; k++) {
-                        const long p = i * SI + j * SJ + k;
-                        const double up = u[p], ap = a[p];
-                        double flux = 0.0;
-                        flux += (ap + a[p - SI]) * (u[p - SI] - up);
-                        flux += (ap + a[p + SI]) * (u[p + SI] - up);
-                        flux += (ap + a[p - SJ]) * (u[p - SJ] - up);
-                        flux += (ap + a[p + SJ]) * (u[p + SJ] - up);
-                        flux += (ap + a[p - 1])  * (u[p - 1]  - up);
-                        flux += (ap + a[p + 1])  * (u[p + 1]  - up);
-                        const double r = up + flux * (1.0 / 12.0);
-                        const double val = reactive(inc, B, i, j, k) ? react(r) : r;
-                        unew[p] = val;
-                        step_energy += val * val;
-                    }
+    while (steps < T) {
+        for (long i = 1; i <= N; i++)
+            for (long j = 1; j <= N; j++)
+                for (long k = 1; k <= N; k++) {
+                    const long p = i * SI + j * SJ + k;
+                    const double up = u[p], ap = a[p];
+                    double flux = 0.0;
+                    flux += (ap + a[p - SI]) * (u[p - SI] - up);
+                    flux += (ap + a[p + SI]) * (u[p + SI] - up);
+                    flux += (ap + a[p - SJ]) * (u[p - SJ] - up);
+                    flux += (ap + a[p + SJ]) * (u[p + SJ] - up);
+                    flux += (ap + a[p - 1]) * (u[p - 1] - up);
+                    flux += (ap + a[p + 1]) * (u[p + 1] - up);
+                    const double r = up + flux * (1.0 / 12.0);
+                    unew[p] = mat[p] ? react(r) : r;
                 }
-            }
-
-#pragma omp single
-            {
-                u.swap(unew);
-                steps++;
-                energy = step_energy;
-                step_energy = 0.0;
-            }
-
-            if (energy <= threshold) break;
-        }
+        u.swap(unew);
+        steps++;
+        energy = energy_of(u);
+        if (energy <= theta * energy0) break;
     }
 
     FILE* out = fopen(argv[5], "w");
