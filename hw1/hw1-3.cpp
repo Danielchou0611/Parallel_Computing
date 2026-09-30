@@ -60,6 +60,11 @@ static double react(double r) {
 }
 // =========== END: DO NOT CHANGE ABOVE ===========
 
+struct RowSphere {
+    double ck;
+    double rem_r2;
+};
+
 int main(int argc, char** argv) {
     if (argc != 6) return 1;
     const long N = atol(argv[1]);
@@ -85,40 +90,43 @@ int main(int argc, char** argv) {
     const int B = inclusions(seed, N, inc);
     double energy0 = 0.0;
 
-    // Parallel first-touch: initialize halo and interior in parallel
+    // Zero out top and bottom halo slices (i = 0 and i = M - 1)
+    memset(&u[0], 0, SI * sizeof(double));
+    memset(&unew[0], 0, SI * sizeof(double));
+    memset(&a[0], 0, SI * sizeof(double));
+    memset(&u[(M - 1) * SI], 0, SI * sizeof(double));
+    memset(&unew[(M - 1) * SI], 0, SI * sizeof(double));
+    memset(&a[(M - 1) * SI], 0, SI * sizeof(double));
+
+    // Parallel first-touch: exactly matching simulation loop (i = 1 .. N, schedule(static, 1))
+    // Guarantees perfect NUMA node and cache affinity between threads and their memory pages
 #pragma omp parallel for schedule(static, 1) reduction(+:energy0)
-    for (long i = 0; i < M; i++) {
+    for (long i = 1; i <= N; i++) {
         const long i_SI = i * SI;
-        if (i == 0 || i == M - 1) {
-            memset(&u[i_SI], 0, SI * sizeof(double));
-            memset(&unew[i_SI], 0, SI * sizeof(double));
-            memset(&a[i_SI], 0, SI * sizeof(double));
-        } else {
-            // Zero halos at j=0 and j=M-1
-            memset(&u[i_SI], 0, SJ * sizeof(double));
-            memset(&unew[i_SI], 0, SJ * sizeof(double));
-            memset(&a[i_SI], 0, SJ * sizeof(double));
-            memset(&u[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
-            memset(&unew[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
-            memset(&a[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+        // Zero halos at j=0 and j=M-1
+        memset(&u[i_SI], 0, SJ * sizeof(double));
+        memset(&unew[i_SI], 0, SJ * sizeof(double));
+        memset(&a[i_SI], 0, SJ * sizeof(double));
+        memset(&u[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+        memset(&unew[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+        memset(&a[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
 
-            for (long j = 1; j <= N; j++) {
-                const long j_SJ = j * SJ;
-                double* u_row = &u[i_SI + j_SJ];
-                double* unew_row = &unew[i_SI + j_SJ];
-                double* a_row = &a[i_SI + j_SJ];
-                u_row[0] = 0.0; u_row[N + 1] = 0.0;
-                unew_row[0] = 0.0; unew_row[N + 1] = 0.0;
-                a_row[0] = 0.0; a_row[N + 1] = 0.0;
+        for (long j = 1; j <= N; j++) {
+            const long j_SJ = j * SJ;
+            double* u_row = &u[i_SI + j_SJ];
+            double* unew_row = &unew[i_SI + j_SJ];
+            double* a_row = &a[i_SI + j_SJ];
+            u_row[0] = 0.0; u_row[N + 1] = 0.0;
+            unew_row[0] = 0.0; unew_row[N + 1] = 0.0;
+            a_row[0] = 0.0; a_row[N + 1] = 0.0;
 
-                const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
-                for (long k = 1; k <= N; k++) {
-                    const uint64_t index = base_idx + (k - 1);
-                    const double u_val = field(seed, index, 0);
-                    u_row[k] = u_val;
-                    a_row[k] = field(seed, index, 1);
-                    energy0 += u_val * u_val;
-                }
+            const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
+            for (long k = 1; k <= N; k++) {
+                const uint64_t index = base_idx + (k - 1);
+                const double u_val = field(seed, index, 0);
+                u_row[k] = u_val;
+                a_row[k] = field(seed, index, 1);
+                energy0 += u_val * u_val;
             }
         }
     }
@@ -181,13 +189,16 @@ int main(int argc, char** argv) {
                         }
                     } else {
                         for (long j = 1; j <= N; j++) {
-                            int act_b[4];
+                            RowSphere act_spheres[4];
                             int n_act = 0;
                             for (int b = 0; b < B; b++) {
                                 const double di = i - inc[b].ci;
                                 const double dj = j - inc[b].cj;
-                                if (di * di + dj * dj <= inc[b].r2) {
-                                    act_b[n_act++] = b;
+                                const double d2 = di * di + dj * dj;
+                                if (d2 <= inc[b].r2) {
+                                    act_spheres[n_act].ck = inc[b].ck;
+                                    act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                    n_act++;
                                 }
                             }
 
@@ -233,9 +244,8 @@ int main(int argc, char** argv) {
                                     const double r = up + flux * (1.0 / 12.0);
                                     bool is_react = false;
                                     for (int a_idx = 0; a_idx < n_act; a_idx++) {
-                                        const int b = act_b[a_idx];
-                                        const double di = i - inc[b].ci, dj = j - inc[b].cj, dk = k - inc[b].ck;
-                                        if (di * di + dj * dj + dk * dk <= inc[b].r2) {
+                                        const double dk = k - act_spheres[a_idx].ck;
+                                        if (dk * dk <= act_spheres[a_idx].rem_r2) {
                                             is_react = true;
                                             break;
                                         }
@@ -322,13 +332,16 @@ int main(int argc, char** argv) {
                         }
                     } else {
                         for (long j = 1; j <= N; j++) {
-                            bool row_has_sphere = false;
+                            RowSphere act_spheres[4];
+                            int n_act = 0;
                             for (int b = 0; b < B; b++) {
                                 const double di = i - inc[b].ci;
                                 const double dj = j - inc[b].cj;
-                                if (di * di + dj * dj <= inc[b].r2) {
-                                    row_has_sphere = true;
-                                    break;
+                                const double d2 = di * di + dj * dj;
+                                if (d2 <= inc[b].r2) {
+                                    act_spheres[n_act].ck = inc[b].ck;
+                                    act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                    n_act++;
                                 }
                             }
 
@@ -350,7 +363,7 @@ int main(int argc, char** argv) {
 
                             double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
-                            if (!row_has_sphere) {
+                            if (n_act == 0) {
                                 #pragma GCC ivdep
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
@@ -374,7 +387,15 @@ int main(int argc, char** argv) {
                                                       + (ap + ac[k - 1]) * (uc[k - 1] - up)
                                                       + (ap + ac[k + 1]) * (uc[k + 1] - up);
                                     const double r = up + flux * (1.0 / 12.0);
-                                    const double val = reactive(inc, B, i, j, k) ? react(r) : r;
+                                    bool is_react = false;
+                                    for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                        const double dk = k - act_spheres[a_idx].ck;
+                                        if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                            is_react = true;
+                                            break;
+                                        }
+                                    }
+                                    const double val = is_react ? react(r) : r;
                                     unew_row[k] = val;
                                     step_energy += val * val;
                                 }
