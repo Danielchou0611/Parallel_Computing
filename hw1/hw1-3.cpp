@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include <omp.h>
 #include <sys/mman.h>
 
@@ -78,7 +79,6 @@ int main(int argc, char** argv) {
     const size_t total_elements = (size_t)M * SI;
     const size_t total_bytes = total_elements * sizeof(double);
 
-    // Fast allocation using mmap with hugepage hint
     double* u = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     double* unew = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     double* a = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -101,7 +101,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Zero out top and bottom halo slices (i = 0 and i = M - 1)
     memset(&u[0], 0, SI * sizeof(double));
     memset(&unew[0], 0, SI * sizeof(double));
     memset(&a[0], 0, SI * sizeof(double));
@@ -109,12 +108,9 @@ int main(int argc, char** argv) {
     memset(&unew[(M - 1) * SI], 0, SI * sizeof(double));
     memset(&a[(M - 1) * SI], 0, SI * sizeof(double));
 
-    // Parallel first-touch: exactly matching simulation loop (i = 1 .. N, schedule(static, 1))
-    // Guarantees perfect NUMA node and cache affinity between threads and their memory pages
 #pragma omp parallel for schedule(static, 1) reduction(+:energy0)
     for (long i = 1; i <= N; i++) {
         const long i_SI = i * SI;
-        // Zero halos at j=0 and j=M-1
         memset(&u[i_SI], 0, SJ * sizeof(double));
         memset(&unew[i_SI], 0, SJ * sizeof(double));
         memset(&a[i_SI], 0, SJ * sizeof(double));
@@ -147,82 +143,158 @@ int main(int argc, char** argv) {
     const double threshold = theta * energy0;
     double step_energy = 0.0;
 
+    const bool use_tiling = (B == 0) || (N >= 640);
+    const int BJ = 32;
+
     if (threshold <= 0.0) {
+        double final_energy = 0.0;
 #pragma omp parallel
         {
-            for (int s = 0; s < T; s++) {
-#pragma omp for schedule(static, 1)
-                for (long i = 1; i <= N; i++) {
-                    const long i_SI = i * SI;
-                    const long im_SI = (i - 1) * SI;
-                    const long ip_SI = (i + 1) * SI;
+            double* cur_u = u;
+            double* cur_unew = unew;
 
-                    if (!slice_has_sphere[i]) {
-                        for (long j = 1; j <= N; j++) {
-                            const long j_SJ = j * SJ;
-                            const long jm_SJ = (j - 1) * SJ;
-                            const long jp_SJ = (j + 1) * SJ;
+            if (use_tiling) {
+                for (int s = 0; s < T; s++) {
+#pragma omp for schedule(dynamic, 1)
+                    for (long j_start = 1; j_start <= N; j_start += BJ) {
+                        const long j_end = std::min(N, j_start + BJ - 1);
+                        for (long i = 1; i <= N; i++) {
+                            const long i_SI = i * SI;
+                            const long im_SI = (i - 1) * SI;
+                            const long ip_SI = (i + 1) * SI;
 
-                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+                            if (!slice_has_sphere[i]) {
+                                for (long j = j_start; j <= j_end; j++) {
+                                    const long j_SJ = j * SJ;
+                                    const long jm_SJ = (j - 1) * SJ;
+                                    const long jp_SJ = (j + 1) * SJ;
 
-                            const double* __restrict__ ac  = &a[i_SI + j_SJ];
-                            const double* __restrict__ aim = &a[im_SI + j_SJ];
-                            const double* __restrict__ aip = &a[ip_SI + j_SJ];
-                            const double* __restrict__ ajm = &a[i_SI + jm_SJ];
-                            const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+                                    const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                    const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                    const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                    const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                    const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+                                    const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                    const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                    const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                    const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                    const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                            #pragma GCC ivdep
-                            for (long k = 1; k <= N; k++) {
-                                const double up = uc[k], ap = ac[k];
-                                const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                  + (ap + aip[k]) * (uip[k] - up)
-                                                  + (ap + ajm[k]) * (ujm[k] - up)
-                                                  + (ap + ajp[k]) * (ujp[k] - up)
-                                                  + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                  + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                unew_row[k] = up + flux * (1.0 / 12.0);
-                            }
-                        }
-                    } else {
-                        for (long j = 1; j <= N; j++) {
-                            RowSphere act_spheres[4];
-                            int n_act = 0;
-                            for (int b = 0; b < B; b++) {
-                                const double di = i - inc[b].ci;
-                                const double dj = j - inc[b].cj;
-                                const double d2 = di * di + dj * dj;
-                                if (d2 <= inc[b].r2) {
-                                    act_spheres[n_act].ck = inc[b].ck;
-                                    act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
-                                    n_act++;
+                                    double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
+
+                                    #pragma GCC ivdep
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        unew_row[k] = up + flux * (1.0 / 12.0);
+                                    }
+                                }
+                            } else {
+                                for (long j = j_start; j <= j_end; j++) {
+                                    RowSphere act_spheres[4];
+                                    int n_act = 0;
+                                    for (int b = 0; b < B; b++) {
+                                        const double di = i - inc[b].ci;
+                                        const double dj = j - inc[b].cj;
+                                        const double d2 = di * di + dj * dj;
+                                        if (d2 <= inc[b].r2) {
+                                            act_spheres[n_act].ck = inc[b].ck;
+                                            act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                            n_act++;
+                                        }
+                                    }
+
+                                    const long j_SJ = j * SJ;
+                                    const long jm_SJ = (j - 1) * SJ;
+                                    const long jp_SJ = (j + 1) * SJ;
+
+                                    const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                    const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                    const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                    const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                    const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
+
+                                    const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                    const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                    const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                    const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                    const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+
+                                    double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
+
+                                    if (n_act == 0) {
+                                        #pragma GCC ivdep
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            unew_row[k] = up + flux * (1.0 / 12.0);
+                                        }
+                                    } else {
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            const double r = up + flux * (1.0 / 12.0);
+                                            bool is_react = false;
+                                            for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                                const double dk = k - act_spheres[a_idx].ck;
+                                                if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                    is_react = true;
+                                                    break;
+                                                }
+                                            }
+                                            unew_row[k] = is_react ? react(r) : r;
+                                        }
+                                    }
                                 }
                             }
+                        }
+                    }
+                    std::swap(cur_u, cur_unew);
+                }
+            } else {
+                for (int s = 0; s < T; s++) {
+#pragma omp for schedule(static, 1)
+                    for (long i = 1; i <= N; i++) {
+                        const long i_SI = i * SI;
+                        const long im_SI = (i - 1) * SI;
+                        const long ip_SI = (i + 1) * SI;
 
-                            const long j_SJ = j * SJ;
-                            const long jm_SJ = (j - 1) * SJ;
-                            const long jp_SJ = (j + 1) * SJ;
+                        if (!slice_has_sphere[i]) {
+                            for (long j = 1; j <= N; j++) {
+                                const long j_SJ = j * SJ;
+                                const long jm_SJ = (j - 1) * SJ;
+                                const long jp_SJ = (j + 1) * SJ;
 
-                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                            const double* __restrict__ ac  = &a[i_SI + j_SJ];
-                            const double* __restrict__ aim = &a[im_SI + j_SJ];
-                            const double* __restrict__ aip = &a[ip_SI + j_SJ];
-                            const double* __restrict__ ajm = &a[i_SI + jm_SJ];
-                            const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
-                            if (n_act == 0) {
                                 #pragma GCC ivdep
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
@@ -234,129 +306,256 @@ int main(int argc, char** argv) {
                                                       + (ap + ac[k + 1]) * (uc[k + 1] - up);
                                     unew_row[k] = up + flux * (1.0 / 12.0);
                                 }
-                            } else {
-                                for (long k = 1; k <= N; k++) {
-                                    const double up = uc[k], ap = ac[k];
-                                    const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                      + (ap + aip[k]) * (uip[k] - up)
-                                                      + (ap + ajm[k]) * (ujm[k] - up)
-                                                      + (ap + ajp[k]) * (ujp[k] - up)
-                                                      + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                      + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                    const double r = up + flux * (1.0 / 12.0);
-                                    bool is_react = false;
-                                    for (int a_idx = 0; a_idx < n_act; a_idx++) {
-                                        const double dk = k - act_spheres[a_idx].ck;
-                                        if (dk * dk <= act_spheres[a_idx].rem_r2) {
-                                            is_react = true;
-                                            break;
-                                        }
+                            }
+                        } else {
+                            for (long j = 1; j <= N; j++) {
+                                RowSphere act_spheres[4];
+                                int n_act = 0;
+                                for (int b = 0; b < B; b++) {
+                                    const double di = i - inc[b].ci;
+                                    const double dj = j - inc[b].cj;
+                                    const double d2 = di * di + dj * dj;
+                                    if (d2 <= inc[b].r2) {
+                                        act_spheres[n_act].ck = inc[b].ck;
+                                        act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                        n_act++;
                                     }
-                                    unew_row[k] = is_react ? react(r) : r;
+                                }
+
+                                const long j_SJ = j * SJ;
+                                const long jm_SJ = (j - 1) * SJ;
+                                const long jp_SJ = (j + 1) * SJ;
+
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
+
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
+
+                                if (n_act == 0) {
+                                    #pragma GCC ivdep
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        unew_row[k] = up + flux * (1.0 / 12.0);
+                                    }
+                                } else {
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        bool is_react = false;
+                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                            const double dk = k - act_spheres[a_idx].ck;
+                                            if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                is_react = true;
+                                                break;
+                                            }
+                                        }
+                                        unew_row[k] = is_react ? react(r) : r;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-
-#pragma omp single
-                {
-                    std::swap(u, unew);
+                    std::swap(cur_u, cur_unew);
                 }
             }
+
+#pragma omp for schedule(static, 1) reduction(+:final_energy)
+            for (long i = 1; i <= N; i++) {
+                const long i_SI = i * SI;
+                for (long j = 1; j <= N; j++) {
+                    const double* __restrict__ u_row = &cur_u[i_SI + j * SJ];
+                    for (long k = 1; k <= N; k++) {
+                        final_energy += u_row[k] * u_row[k];
+                    }
+                }
+            }
+        }
+        if (T % 2 == 1) {
+            std::swap(u, unew);
         }
         steps = T;
-
-        double final_energy = 0.0;
-#pragma omp parallel for schedule(static, 1) reduction(+:final_energy)
-        for (long i = 1; i <= N; i++) {
-            const long i_SI = i * SI;
-            for (long j = 1; j <= N; j++) {
-                const double* __restrict__ u_row = &u[i_SI + j * SJ];
-                for (long k = 1; k <= N; k++) {
-                    final_energy += u_row[k] * u_row[k];
-                }
-            }
-        }
         energy = final_energy;
     } else {
 #pragma omp parallel
         {
-            while (steps < T) {
-#pragma omp for schedule(static, 1) reduction(+:step_energy)
-                for (long i = 1; i <= N; i++) {
-                    const long i_SI = i * SI;
-                    const long im_SI = (i - 1) * SI;
-                    const long ip_SI = (i + 1) * SI;
+            if (use_tiling) {
+                while (steps < T) {
+#pragma omp for schedule(dynamic, 1) reduction(+:step_energy)
+                    for (long j_start = 1; j_start <= N; j_start += BJ) {
+                        const long j_end = std::min(N, j_start + BJ - 1);
+                        for (long i = 1; i <= N; i++) {
+                            const long i_SI = i * SI;
+                            const long im_SI = (i - 1) * SI;
+                            const long ip_SI = (i + 1) * SI;
 
-                    if (!slice_has_sphere[i]) {
-                        for (long j = 1; j <= N; j++) {
-                            const long j_SJ = j * SJ;
-                            const long jm_SJ = (j - 1) * SJ;
-                            const long jp_SJ = (j + 1) * SJ;
+                            if (!slice_has_sphere[i]) {
+                                for (long j = j_start; j <= j_end; j++) {
+                                    const long j_SJ = j * SJ;
+                                    const long jm_SJ = (j - 1) * SJ;
+                                    const long jp_SJ = (j + 1) * SJ;
 
-                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+                                    const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                                    const double* __restrict__ uim = &u[im_SI + j_SJ];
+                                    const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                                    const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                                    const double* __restrict__ ujp = &u[i_SI + jp_SJ];
 
-                            const double* __restrict__ ac  = &a[i_SI + j_SJ];
-                            const double* __restrict__ aim = &a[im_SI + j_SJ];
-                            const double* __restrict__ aip = &a[ip_SI + j_SJ];
-                            const double* __restrict__ ajm = &a[i_SI + jm_SJ];
-                            const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+                                    const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                    const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                    const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                    const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                    const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+                                    double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
-                            #pragma GCC ivdep
-                            for (long k = 1; k <= N; k++) {
-                                const double up = uc[k], ap = ac[k];
-                                const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                  + (ap + aip[k]) * (uip[k] - up)
-                                                  + (ap + ajm[k]) * (ujm[k] - up)
-                                                  + (ap + ajp[k]) * (ujp[k] - up)
-                                                  + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                  + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                const double r = up + flux * (1.0 / 12.0);
-                                unew_row[k] = r;
-                                step_energy += r * r;
-                            }
-                        }
-                    } else {
-                        for (long j = 1; j <= N; j++) {
-                            RowSphere act_spheres[4];
-                            int n_act = 0;
-                            for (int b = 0; b < B; b++) {
-                                const double di = i - inc[b].ci;
-                                const double dj = j - inc[b].cj;
-                                const double d2 = di * di + dj * dj;
-                                if (d2 <= inc[b].r2) {
-                                    act_spheres[n_act].ck = inc[b].ck;
-                                    act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
-                                    n_act++;
+                                    #pragma GCC ivdep
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        unew_row[k] = r;
+                                        step_energy += r * r;
+                                    }
+                                }
+                            } else {
+                                for (long j = j_start; j <= j_end; j++) {
+                                    RowSphere act_spheres[4];
+                                    int n_act = 0;
+                                    for (int b = 0; b < B; b++) {
+                                        const double di = i - inc[b].ci;
+                                        const double dj = j - inc[b].cj;
+                                        const double d2 = di * di + dj * dj;
+                                        if (d2 <= inc[b].r2) {
+                                            act_spheres[n_act].ck = inc[b].ck;
+                                            act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                            n_act++;
+                                        }
+                                    }
+
+                                    const long j_SJ = j * SJ;
+                                    const long jm_SJ = (j - 1) * SJ;
+                                    const long jp_SJ = (j + 1) * SJ;
+
+                                    const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                                    const double* __restrict__ uim = &u[im_SI + j_SJ];
+                                    const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                                    const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                                    const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+
+                                    const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                    const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                    const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                    const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                    const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+
+                                    double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+
+                                    if (n_act == 0) {
+                                        #pragma GCC ivdep
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            const double r = up + flux * (1.0 / 12.0);
+                                            unew_row[k] = r;
+                                            step_energy += r * r;
+                                        }
+                                    } else {
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            const double r = up + flux * (1.0 / 12.0);
+                                            bool is_react = false;
+                                            for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                                const double dk = k - act_spheres[a_idx].ck;
+                                                if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                    is_react = true;
+                                                    break;
+                                                }
+                                            }
+                                            const double val = is_react ? react(r) : r;
+                                            unew_row[k] = val;
+                                            step_energy += val * val;
+                                        }
+                                    }
                                 }
                             }
+                        }
+                    }
 
-                            const long j_SJ = j * SJ;
-                            const long jm_SJ = (j - 1) * SJ;
-                            const long jp_SJ = (j + 1) * SJ;
+#pragma omp single
+                    {
+                        std::swap(u, unew);
+                        steps++;
+                        energy = step_energy;
+                        step_energy = 0.0;
+                    }
 
-                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+                    if (energy <= threshold) break;
+                }
+            } else {
+                while (steps < T) {
+#pragma omp for schedule(static, 1) reduction(+:step_energy)
+                    for (long i = 1; i <= N; i++) {
+                        const long i_SI = i * SI;
+                        const long im_SI = (i - 1) * SI;
+                        const long ip_SI = (i + 1) * SI;
 
-                            const double* __restrict__ ac  = &a[i_SI + j_SJ];
-                            const double* __restrict__ aim = &a[im_SI + j_SJ];
-                            const double* __restrict__ aip = &a[ip_SI + j_SJ];
-                            const double* __restrict__ ajm = &a[i_SI + jm_SJ];
-                            const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+                        if (!slice_has_sphere[i]) {
+                            for (long j = 1; j <= N; j++) {
+                                const long j_SJ = j * SJ;
+                                const long jm_SJ = (j - 1) * SJ;
+                                const long jp_SJ = (j + 1) * SJ;
 
-                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+                                const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &u[i_SI + jp_SJ];
 
-                            if (n_act == 0) {
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+
+                                double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+
                                 #pragma GCC ivdep
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
@@ -370,42 +569,91 @@ int main(int argc, char** argv) {
                                     unew_row[k] = r;
                                     step_energy += r * r;
                                 }
-                            } else {
-                                for (long k = 1; k <= N; k++) {
-                                    const double up = uc[k], ap = ac[k];
-                                    const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                      + (ap + aip[k]) * (uip[k] - up)
-                                                      + (ap + ajm[k]) * (ujm[k] - up)
-                                                      + (ap + ajp[k]) * (ujp[k] - up)
-                                                      + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                      + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                    const double r = up + flux * (1.0 / 12.0);
-                                    bool is_react = false;
-                                    for (int a_idx = 0; a_idx < n_act; a_idx++) {
-                                        const double dk = k - act_spheres[a_idx].ck;
-                                        if (dk * dk <= act_spheres[a_idx].rem_r2) {
-                                            is_react = true;
-                                            break;
-                                        }
+                            }
+                        } else {
+                            for (long j = 1; j <= N; j++) {
+                                RowSphere act_spheres[4];
+                                int n_act = 0;
+                                for (int b = 0; b < B; b++) {
+                                    const double di = i - inc[b].ci;
+                                    const double dj = j - inc[b].cj;
+                                    const double d2 = di * di + dj * dj;
+                                    if (d2 <= inc[b].r2) {
+                                        act_spheres[n_act].ck = inc[b].ck;
+                                        act_spheres[n_act].rem_r2 = inc[b].r2 - d2;
+                                        n_act++;
                                     }
-                                    const double val = is_react ? react(r) : r;
-                                    unew_row[k] = val;
-                                    step_energy += val * val;
+                                }
+
+                                const long j_SJ = j * SJ;
+                                const long jm_SJ = (j - 1) * SJ;
+                                const long jp_SJ = (j + 1) * SJ;
+
+                                const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &u[i_SI + jp_SJ];
+
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
+
+                                double* __restrict__ unew_row = &unew[i_SI + j_SJ];
+
+                                if (n_act == 0) {
+                                    #pragma GCC ivdep
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        unew_row[k] = r;
+                                        step_energy += r * r;
+                                    }
+                                } else {
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        bool is_react = false;
+                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                            const double dk = k - act_spheres[a_idx].ck;
+                                            if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                is_react = true;
+                                                break;
+                                            }
+                                        }
+                                        const double val = is_react ? react(r) : r;
+                                        unew_row[k] = val;
+                                        step_energy += val * val;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
 #pragma omp single
-                {
-                    std::swap(u, unew);
-                    steps++;
-                    energy = step_energy;
-                    step_energy = 0.0;
-                }
+                    {
+                        std::swap(u, unew);
+                        steps++;
+                        energy = step_energy;
+                        step_energy = 0.0;
+                    }
 
-                if (energy <= threshold) break;
+                    if (energy <= threshold) break;
+                }
             }
         }
     }
