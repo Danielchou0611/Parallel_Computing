@@ -99,7 +99,14 @@ static void init_lut() {
     }
 }
 
-void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width) {
+struct RawImage {
+    int height = 0, width = 0, channels = 0;
+    size_t rowbytes = 0;
+    png_byte* raw_buf = nullptr;
+    ~RawImage() { if (raw_buf) free(raw_buf); }
+};
+
+void read_png_raw(const char* file_name, RawImage& raw) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -116,8 +123,8 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     png_init_io(png, fp);
     png_read_info(png, info);
 
-    width = png_get_image_width(png, info);
-    height = png_get_image_height(png, info);
+    raw.width = png_get_image_width(png, info);
+    raw.height = png_get_image_height(png, info);
     png_byte color_type = png_get_color_type(png, info);
     png_byte bit_depth = png_get_bit_depth(png, info);
     png_set_crc_action(png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
@@ -130,14 +137,30 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
 
     png_read_update_info(png, info);
 
-    int channels = png_get_channels(png, info);
-    size_t rowbytes = png_get_rowbytes(png, info);
-    png_byte* row = (png_byte*)malloc(rowbytes);
+    raw.channels = png_get_channels(png, info);
+    raw.rowbytes = png_get_rowbytes(png, info);
+    raw.raw_buf = (png_byte*)malloc(raw.height * raw.rowbytes);
 
+    std::vector<png_bytep> row_pointers(raw.height);
+    for (int y = 0; y < raw.height; y++)
+        row_pointers[y] = raw.raw_buf + y * raw.rowbytes;
+
+    png_read_image(png, row_pointers.data());
+    fclose(fp);
+    png_destroy_read_struct(&png, &info, nullptr);
+}
+
+void raw_to_gray(const RawImage& raw, Mat& gray) {
+    init_lut();
+    int height = raw.height, width = raw.width, channels = raw.channels;
+    size_t rowbytes = raw.rowbytes;
+    const png_byte* raw_buf = raw.raw_buf;
     gray = Mat(height, width);
+
     if (channels == 1) {
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            png_read_row(png, row, nullptr);
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -145,8 +168,9 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
             }
         }
     } else if (channels == 3) {
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            png_read_row(png, row, nullptr);
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -155,8 +179,9 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
             }
         }
     } else {
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; y++) {
-            png_read_row(png, row, nullptr);
+            const png_byte* row = raw_buf + y * rowbytes;
             double* gray_row = gray[y];
             #pragma GCC ivdep
             for (int x = 0; x < width; x++) {
@@ -165,9 +190,6 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
             }
         }
     }
-    free(row);
-    fclose(fp);
-    png_destroy_read_struct(&png, &info, nullptr);
 }
 
 const int NUM_OCTAVES = 4;
@@ -212,8 +234,7 @@ static void init_gaussian_kernels() {
 }
 
 // Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
-void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk, double* tmp_buf, Mat& out,
-                  const double* prev_g = nullptr, double* out_dog = nullptr) {
+void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk, double* tmp_buf, Mat& out) {
     int radius = gk.radius;
     int K = gk.K;
     const double* k_ptr = gk.kernel;
@@ -281,7 +302,7 @@ void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk
             }
         }
 
-        // Pass 2: Vertical blur (8-tap contiguous row accumulation) + Fused DoG
+        // Pass 2: Vertical blur (8-tap contiguous row accumulation)
         #pragma omp for schedule(static)
         for (int y = 0; y < height; y++) {
             double* out_row = out[y];
@@ -360,15 +381,6 @@ void gaussianBlur(const Mat& in, int height, int width, const GaussianKernel& gk
                     out_row[x] += r[x] * c;
                 }
             }
-
-            if (out_dog && prev_g) {
-                const double* prev_row = prev_g + y * width;
-                double* dog_row = out_dog + y * width;
-                #pragma GCC ivdep
-                for (int x = 0; x < width; x++) {
-                    dog_row[x] = out_row[x] - prev_row[x];
-                }
-            }
         }
     }
 }
@@ -405,23 +417,34 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferP
         oct.width = w;
         oct.gaussian.resize(NUM_SCALES);
         oct.gaussian[0] = base;
+        auto t_o0 = std::chrono::high_resolution_clock::now();
+        for (int s = 1; s < NUM_SCALES; s++) {
+            oct.gaussian[s] = pool.allocMat(h, w);
+            gaussianBlur(base, h, w, s_kernels[s], tmp_buf, oct.gaussian[s]);
+        }
+        auto t_o1 = std::chrono::high_resolution_clock::now();
         oct.dog.resize(NUM_SCALES - 1);
         for (int s = 0; s < NUM_SCALES - 1; s++) {
             oct.dog[s] = pool.allocMat(h, w);
         }
-        auto t_o0 = std::chrono::high_resolution_clock::now();
-        for (int s = 1; s < NUM_SCALES; s++) {
-            oct.gaussian[s] = pool.allocMat(h, w);
-            const double* prev_g = oct.gaussian[s - 1].data_ptr();
-            double* out_dog = oct.dog[s - 1].data_ptr();
-            gaussianBlur(base, h, w, s_kernels[s], tmp_buf, oct.gaussian[s], prev_g, out_dog);
+        int total = h * w;
+        #pragma omp parallel
+        {
+            for (int s = 0; s < NUM_SCALES - 1; s++) {
+                const double* g_next = oct.gaussian[s + 1].data_ptr();
+                const double* g_curr = oct.gaussian[s].data_ptr();
+                double* dog_ptr = oct.dog[s].data_ptr();
+                #pragma omp for nowait
+                for (int i = 0; i < total; i++)
+                    dog_ptr[i] = g_next[i] - g_curr[i];
+            }
         }
-        auto t_o1 = std::chrono::high_resolution_clock::now();
+        auto t_o2 = std::chrono::high_resolution_clock::now();
         if (getenv("PROFILE")) {
             auto ms = [](std::chrono::high_resolution_clock::time_point a, std::chrono::high_resolution_clock::time_point b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
-            std::cerr << "    oct " << o << " (" << w << "x" << h << ") blur+dog: " << ms(t_o0, t_o1) << " ms\n";
+            std::cerr << "    oct " << o << " (" << w << "x" << h << ") blur: " << ms(t_o0, t_o1) << " ms, dog: " << ms(t_o1, t_o2) << " ms\n";
         }
 
         if (o + 1 < NUM_OCTAVES) {
@@ -513,20 +536,18 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
     int max_threads = omp_get_max_threads();
     std::vector<std::vector<Keypoint>> thread_kps(max_threads);
 
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        for (int o = 0; o < NUM_OCTAVES; o++) {
-            const Octave& oct = octaves[o];
-            for (int s = 1; s < (int)oct.dog.size() - 1; s++) {
-                thread_kps[tid].clear();
-                #pragma omp barrier
+    for (int o = 0; o < NUM_OCTAVES; o++) {
+        const Octave& oct = octaves[o];
+        for (int s = 1; s < (int)oct.dog.size() - 1; s++) {
+            for (int t = 0; t < max_threads; t++) thread_kps[t].clear();
+            const Mat& d_prev = oct.dog[s - 1];
+            const Mat& d_curr = oct.dog[s];
+            const Mat& d_next = oct.dog[s + 1];
+            double scale = SIGMA0 * std::pow(2.0, (double)s / S);
 
-                const Mat& d_prev = oct.dog[s - 1];
-                const Mat& d_curr = oct.dog[s];
-                const Mat& d_next = oct.dog[s + 1];
-                double scale = SIGMA0 * std::pow(2.0, (double)s / S);
-
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
                 #pragma omp for schedule(static)
                 for (int y = 1; y < oct.height - 1; y++) {
                     DogSlice slice = {
@@ -552,14 +573,10 @@ std::vector<Keypoint> detectKeypoints(const std::vector<Octave>& octaves) {
                         thread_kps[tid].push_back(kp);
                     }
                 }
+            }
 
-                #pragma omp master
-                {
-                    for (int t = 0; t < max_threads; t++) {
-                        keypoints.insert(keypoints.end(), thread_kps[t].begin(), thread_kps[t].end());
-                    }
-                }
-                #pragma omp barrier
+            for (int t = 0; t < max_threads; t++) {
+                keypoints.insert(keypoints.end(), thread_kps[t].begin(), thread_kps[t].end());
             }
         }
     }
@@ -816,21 +833,30 @@ int main(int argc, char** argv) {
     init_lut();
     init_gaussian_kernels();
 
-    Mat grayA, grayB;
-    int heightA = 0, widthA = 0;
-    int heightB = 0, widthB = 0;
+    RawImage rawA, rawB;
 
     #pragma omp parallel sections
     {
         #pragma omp section
         {
-            read_png_to_gray(argv[1], grayA, heightA, widthA);
+            read_png_raw(argv[1], rawA);
         }
         #pragma omp section
         {
-            read_png_to_gray(argv[2], grayB, heightB, widthB);
+            read_png_raw(argv[2], rawB);
         }
     }
+
+    Mat grayA, grayB;
+    int heightA = rawA.height, widthA = rawA.width;
+    int heightB = rawB.height, widthB = rawB.width;
+
+    raw_to_gray(rawA, grayA);
+    free(rawA.raw_buf); rawA.raw_buf = nullptr;
+
+    raw_to_gray(rawB, grayB);
+    free(rawB.raw_buf); rawB.raw_buf = nullptr;
+
     auto t_read = std::chrono::high_resolution_clock::now();
 
     BufferPool pool;

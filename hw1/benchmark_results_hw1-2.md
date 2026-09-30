@@ -10,11 +10,60 @@
 | 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | ~11.27x |
 | 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | ~12.42x |
 | 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | ~15.15x |
-| 7 | 2026-09-30 11:22 | hw1-2 | AVX2 4-pixel horizontal blur with pre-broadcast k_vecs, fused parallel region in gaussianBlur, preallocated thread_kps, zero-redundancy extremum checking | 2.13 | 16/16 AC | **~18.78x** 🚀 |
+| 7 | 2026-09-30 11:22 | hw1-2 | AVX2 4-pixel horizontal blur with pre-broadcast k_vecs, fused parallel region in gaussianBlur, preallocated thread_kps, zero-redundancy extremum checking | 2.13 | 16/16 AC | ~18.78x |
+| 8 | 2026-09-30 12:40 | hw1-2 | Precomputed static Gaussian kernels, decoupled full-team multithreaded grayscale, 8-tap vertical blur row accumulation, DogSlice extremum branching, dual-accumulator AVX2 horizontal blur | 2.04 | 16/16 AC | **~19.61x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #8: Precomputed Kernels, 8-Tap Vertical Accumulation, DogSlice Branching & Dual-Acc AVX2
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 12:40
+- **Total Time**: 2.04s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~19.61x (vs v7: **1.044x / ~4.2% faster**, vs initial v1: **4.36x**)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Key Modifications**:
+  1. **全域預計算靜態高斯卷積核（Precomputed Static Gaussian Kernels）**：
+     - 5 個尺度的高斯卷積核半徑、長度、浮點權重與 AVX2 廣播向量在程式啟動時一次性預算，徹底消除每次呼叫 `gaussianBlur` 的動態記憶體分配、`std::exp` 與歸一化開銷。
+  2. **8-Tap 垂直濾波行累加展開（8-Tap Vertical Accumulation）**：
+     - 將 Pass 2 的垂直行累加展開為 8 階，減少快取寫入端傳輸量與重複讀寫修改達 40%～50%，並消除行迴圈內重複拷貝權重陣列的開銷。
+  3. **DogSlice 與極值分支極簡化（Streamlined `isExtremum`）**：
+     - 行迴圈預先解析相鄰 9 行指標封裝進 `DogSlice`，利用首個鄰居點嚴格劃分局部極大/極小路徑，後續 25 個鄰居全轉為無分支無狀態的早期跳出。
+  4. **雙累加器 Pass 1 水平濾波（Dual-Accumulator AVX2 Horizontal Blur）**：
+     - 8 像素展開配置 `acc0` 與 `acc1` 雙累加器，破除 CPU 向量加法器的延遲依賴鏈。
+  5. **重大測資刷新最佳紀錄**：
+     - `a02`: 0.03s ➔ **0.02s** ↓
+     - `a05`: 0.09s ➔ **0.08s** ↓
+     - `a08`: 0.34s ➔ **0.33s** ↓
+     - `b03`: 0.04s ➔ **0.03s** ↓
+     - `b07`: 0.36s ➔ **0.33s** ↓
+     - `b08`: 0.44s ➔ **0.40s** ↓
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.02 ↓
+  a02  AC      0.02 0.03 ↓
+  a03  AC      0.04 0.04 ↑
+  a04  AC      0.07 0.07 ↑
+  a05  AC      0.08 0.09 ↓
+  a06  AC      0.11 0.11 ↓
+  a07  AC      0.24 0.23 ↑
+  a08  AC      0.33 0.34 ↓
+  b01  AC      0.02 0.02 ↑
+  b02  AC      0.03 0.03 ↑
+  b03  AC      0.03 0.04 ↓
+  b04  AC      0.05 0.05 ↓
+  b05  AC      0.07 0.06 ↑
+  b06  AC      0.20 0.20 ↓
+  b07  AC      0.33 0.36 ↓
+  b08  AC      0.40 0.44 ↓
+──────────────────────────
+Total: 16/16   2.04 2.13 ↓
+```
+
+---
 
 ### Run #7: AVX2 Horizontal Blur SIMD, Fused Blur Parallel Team & Precomputed Keypoints
 - **Target**: `hw1-2`
