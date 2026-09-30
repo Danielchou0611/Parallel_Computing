@@ -21,12 +21,13 @@ struct Mat {
 
     Mat() = default;
     Mat(int height, int width) : h(height), w(width) {
-        if (h > 0 && w > 0) {
+        if (h > 0 && width > 0) {
             double* p = (double*)malloc(sizeof(double) * h * w);
             buf = std::shared_ptr<double>(p, free);
             data = p;
         }
     }
+    Mat(int height, int width, double* external_ptr) : h(height), w(width), buf(nullptr), data(external_ptr) {}
 
     inline double* operator[](int y) { return data + y * w; }
     inline const double* operator[](int y) const { return data + y * w; }
@@ -34,7 +35,71 @@ struct Mat {
     inline const double* data_ptr() const { return data; }
 };
 
+struct BufferPool {
+    struct Buffer {
+        double* ptr = nullptr;
+        size_t cap = 0;
+        Buffer() = default;
+        Buffer(size_t n) {
+            ptr = (double*)malloc(n * sizeof(double));
+            cap = n;
+        }
+        ~Buffer() { if (ptr) free(ptr); }
+        Buffer(Buffer&& o) noexcept : ptr(o.ptr), cap(o.cap) { o.ptr = nullptr; o.cap = 0; }
+        Buffer& operator=(Buffer&& o) noexcept {
+            if (this != &o) {
+                if (ptr) free(ptr);
+                ptr = o.ptr; cap = o.cap;
+                o.ptr = nullptr; o.cap = 0;
+            }
+            return *this;
+        }
+        Buffer(const Buffer&) = delete;
+        Buffer& operator=(const Buffer&) = delete;
+
+        void ensure(size_t n) {
+            if (cap < n) {
+                ptr = (double*)realloc(ptr, n * sizeof(double));
+                cap = n;
+            }
+        }
+    };
+
+    std::vector<Buffer> buffers;
+    size_t next_idx = 0;
+
+    Mat allocMat(int h, int w) {
+        size_t needed = (size_t)h * w;
+        if (next_idx < buffers.size()) {
+            buffers[next_idx].ensure(needed);
+            double* ptr = buffers[next_idx].ptr;
+            next_idx++;
+            return Mat(h, w, ptr);
+        }
+        buffers.emplace_back(needed);
+        double* ptr = buffers.back().ptr;
+        next_idx++;
+        return Mat(h, w, ptr);
+    }
+
+    void reset() {
+        next_idx = 0;
+    }
+};
+
+static double s_gray_lut[256];
+static bool s_lut_init = false;
+static void init_lut() {
+    if (!s_lut_init) {
+        for (int i = 0; i < 256; i++) {
+            s_gray_lut[i] = (0.299 * i + 0.587 * i + 0.114 * i) / 255.0;
+        }
+        s_lut_init = true;
+    }
+}
+
 void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width) {
+    init_lut();
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -62,14 +127,10 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
     if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
     if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_PALETTE)
-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
-        png_set_gray_to_rgb(png);
 
     png_read_update_info(png, info);
 
+    int channels = png_get_channels(png, info);
     size_t rowbytes = png_get_rowbytes(png, info);
     std::vector<png_byte> raw_buf(height * rowbytes);
     std::vector<png_bytep> row_pointers(height);
@@ -81,20 +142,43 @@ void read_png_to_gray(const char* file_name, Mat& gray, int& height, int& width)
     png_destroy_read_struct(&png, &info, nullptr);
 
     gray = Mat(height, width);
-    #pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        const png_byte* row = &raw_buf[y * rowbytes];
-        double* gray_row = gray[y];
-        #pragma GCC ivdep
-        for (int x = 0; x < width; x++) {
-            const png_byte* px = &row[x * 4];
-            gray_row[x] = (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]) / 255.0;
+    if (channels == 1) {
+        #pragma omp parallel for
+        for (int y = 0; y < height; y++) {
+            const png_byte* row = &raw_buf[y * rowbytes];
+            double* gray_row = gray[y];
+            #pragma GCC ivdep
+            for (int x = 0; x < width; x++) {
+                gray_row[x] = s_gray_lut[row[x]];
+            }
+        }
+    } else if (channels == 3) {
+        #pragma omp parallel for
+        for (int y = 0; y < height; y++) {
+            const png_byte* row = &raw_buf[y * rowbytes];
+            double* gray_row = gray[y];
+            #pragma GCC ivdep
+            for (int x = 0; x < width; x++) {
+                const png_byte* px = &row[x * 3];
+                gray_row[x] = (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]) / 255.0;
+            }
+        }
+    } else {
+        #pragma omp parallel for
+        for (int y = 0; y < height; y++) {
+            const png_byte* row = &raw_buf[y * rowbytes];
+            double* gray_row = gray[y];
+            #pragma GCC ivdep
+            for (int x = 0; x < width; x++) {
+                const png_byte* px = &row[x * channels];
+                gray_row[x] = (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]) / 255.0;
+            }
         }
     }
 }
 
 // Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
-Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp_buf) {
+void gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp_buf, Mat& out) {
     int radius = std::max(1, (int)std::ceil(3 * sigma));
     std::vector<double> kernel(2 * radius + 1);
     double sum = 0.0;
@@ -146,7 +230,6 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp
     }
 
     // Pass 2: Vertical blur (4-tap contiguous row accumulation)
-    Mat out(height, width);
     #pragma omp parallel for
     for (int y = 0; y < height; y++) {
         double* out_row = out[y];
@@ -197,12 +280,10 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma, double* tmp
             }
         }
     }
-    return out;
 }
 
-Mat downsample2x(const Mat& in, int height, int width) {
+void downsample2x(const Mat& in, int height, int width, Mat& out) {
     int nh = height / 2, nw = width / 2;
-    Mat out(nh, nw);
     #pragma omp parallel for
     for (int y = 0; y < nh; y++) {
         const double* in_row = in[2 * y];
@@ -211,7 +292,6 @@ Mat downsample2x(const Mat& in, int height, int width) {
         for (int x = 0; x < nw; x++)
             out_row[x] = in_row[2 * x];
     }
-    return out;
 }
 
 const int NUM_OCTAVES = 4;
@@ -227,11 +307,12 @@ struct Octave {
     std::vector<Mat> dog;      // NUM_SCALES - 1 images
 };
 
-std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
+std::vector<Octave> buildPyramid(const Mat& gray, int height, int width, BufferPool& pool) {
     std::vector<Octave> octaves(NUM_OCTAVES);
     double k = std::pow(2.0, 1.0 / S);
 
-    std::vector<double> tmp_buf(height * width);
+    Mat tmp_mat = pool.allocMat(height, width);
+    double* tmp_buf = tmp_mat.data_ptr();
     Mat base = gray;
     int h = height, w = width;
     for (int o = 0; o < NUM_OCTAVES; o++) {
@@ -243,12 +324,13 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
         auto t_o0 = std::chrono::high_resolution_clock::now();
         for (int s = 1; s < NUM_SCALES; s++) {
             double sigma = SIGMA0 * std::pow(k, s);
-            oct.gaussian[s] = gaussianBlur(base, h, w, sigma, tmp_buf.data());
+            oct.gaussian[s] = pool.allocMat(h, w);
+            gaussianBlur(base, h, w, sigma, tmp_buf, oct.gaussian[s]);
         }
         auto t_o1 = std::chrono::high_resolution_clock::now();
         oct.dog.resize(NUM_SCALES - 1);
         for (int s = 0; s < NUM_SCALES - 1; s++) {
-            oct.dog[s] = Mat(h, w);
+            oct.dog[s] = pool.allocMat(h, w);
         }
         int total = h * w;
         #pragma omp parallel
@@ -271,10 +353,16 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
         }
 
         if (o + 1 < NUM_OCTAVES) {
-            base = downsample2x(oct.gaussian[S], h, w); // carry over scale = 2*sigma0
+            Mat down = pool.allocMat(h / 2, w / 2);
+            downsample2x(oct.gaussian[S], h, w, down);
+            base = down;
             h /= 2;
             w /= 2;
         }
+        // Early release of unused Gaussians
+        oct.gaussian[0] = Mat();
+        oct.gaussian[4] = Mat();
+        oct.gaussian[5] = Mat();
     }
     return octaves;
 }
@@ -387,21 +475,33 @@ void assignOrientation(Keypoint& kp, const Octave& oct) {
     int radius = (int)std::round(3 * sigma);
 
     const int NBINS = 36;
-    std::vector<double> hist(NBINS, 0.0);
+    double hist[NBINS] = {0.0};
+
+    // Precompute 1D Gaussian weights for dx and dy
+    double inv_2sigma2 = 1.0 / (2.0 * sigma * sigma);
+    double exp_weight[65];
+    for (int d = -radius; d <= radius; d++) {
+        exp_weight[d + radius] = std::exp(-(d * d) * inv_2sigma2);
+    }
 
     for (int dy = -radius; dy <= radius; dy++) {
         int y = kp.y + dy;
         if (y <= 0 || y >= oct.height - 1) continue;
+        double wy = exp_weight[dy + radius];
+        const double* img_y = img[y];
+        const double* img_yp1 = img[y + 1];
+        const double* img_ym1 = img[y - 1];
+
         for (int dx = -radius; dx <= radius; dx++) {
             int x = kp.x + dx;
             if (x <= 0 || x >= oct.width - 1) continue;
 
-            double gx = img[y][x + 1] - img[y][x - 1];
-            double gy = img[y + 1][x] - img[y - 1][x];
+            double gx = img_y[x + 1] - img_y[x - 1];
+            double gy = img_yp1[x] - img_ym1[x];
             double mag = std::sqrt(gx * gx + gy * gy);
             double angle = std::atan2(gy, gx); // (-pi, pi]
 
-            double weight = std::exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
+            double weight = wy * exp_weight[dx + radius];
             int bin = (int)std::round((angle + M_PI) / (2 * M_PI) * NBINS) % NBINS;
             hist[bin] += mag * weight;
         }
@@ -421,7 +521,7 @@ void computeDescriptor(Keypoint& kp, const Octave& oct) {
     const int WINDOW = 16, CELLS = 4, BINS = 8;
     double cosA = std::cos(kp.orientation), sinA = std::sin(kp.orientation);
 
-    std::vector<double> desc(CELLS * CELLS * BINS, 0.0);
+    double desc[128] = {0.0};
 
     for (int i = -WINDOW / 2; i < WINDOW / 2; i++) {
         for (int j = -WINDOW / 2; j < WINDOW / 2; j++) {
@@ -450,27 +550,31 @@ void computeDescriptor(Keypoint& kp, const Octave& oct) {
     }
 
     double norm = 0.0;
-    for (double v : desc) norm += v * v;
+    for (int k = 0; k < 128; k++) norm += desc[k] * desc[k];
     norm = std::sqrt(norm) + 1e-12;
-    for (double& v : desc) v = std::min(v / norm, 0.2); // clip large gradients (illumination robustness)
+    for (int k = 0; k < 128; k++) desc[k] = std::min(desc[k] / norm, 0.2); // clip large gradients
 
     norm = 0.0;
-    for (double v : desc) norm += v * v;
+    for (int k = 0; k < 128; k++) norm += desc[k] * desc[k];
     norm = std::sqrt(norm) + 1e-12;
-    for (double& v : desc) v /= norm;
+    for (int k = 0; k < 128; k++) desc[k] /= norm;
 
-    kp.descriptor = desc;
+    kp.descriptor.assign(desc, desc + 128);
 }
 
 struct FeatureSet {
     std::vector<Keypoint> keypoints;
 };
 
-FeatureSet extractFeatures(const Mat& gray, int height, int width) {
+FeatureSet extractFeatures(const Mat& gray, int height, int width, BufferPool& pool) {
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto octaves = buildPyramid(gray, height, width);
+    auto octaves = buildPyramid(gray, height, width, pool);
     auto t1 = std::chrono::high_resolution_clock::now();
     auto keypoints = detectKeypoints(octaves);
+    for (auto& oct : octaves) {
+        oct.dog.clear();
+        oct.dog.shrink_to_fit();
+    }
     auto t2 = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for
     for (size_t i = 0; i < keypoints.size(); i++) {
@@ -626,10 +730,15 @@ int main(int argc, char** argv) {
     }
     auto t_read = std::chrono::high_resolution_clock::now();
 
-    FeatureSet featuresA = extractFeatures(grayA, heightA, widthA);
+    BufferPool pool;
+    FeatureSet featuresA = extractFeatures(grayA, heightA, widthA, pool);
+    grayA = Mat();
+    pool.reset();
     auto t_featA = std::chrono::high_resolution_clock::now();
 
-    FeatureSet featuresB = extractFeatures(grayB, heightB, widthB);
+    FeatureSet featuresB = extractFeatures(grayB, heightB, widthB, pool);
+    grayB = Mat();
+    pool.reset();
     auto t_featB = std::chrono::high_resolution_clock::now();
 
     std::vector<Match> matches = matchFeatures(featuresA, featuresB);
