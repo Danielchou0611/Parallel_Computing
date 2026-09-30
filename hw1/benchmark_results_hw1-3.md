@@ -7,7 +7,8 @@
 | 0 | 2026-09-30 17:50 | hw1-3 | Sequential Baseline (Unparallelized) | ~160.0s (TLE on p03, p05, p07, p08, p10) | 5/10 AC (160 penalty) | 1.00x |
 | 1 | 2026-09-30 18:05 | hw1-3 | OpenMP initial parallelization, fused energy reduction, eliminate 0.89 GB mat array | ~40.6s | Local pass | ~4.0x |
 | 2 | 2026-09-30 18:23 | hw1-3 | Hoisted 1D row pointers, 2-level sphere bounding-box peeling (slice/row level) | ~36.2s | Local pass | ~4.4x |
-| 3 | 2026-09-30 20:18 | hw1-3 | 64-byte aligned row strides, schedule(static, 4) interleaved chunks eliminating load imbalance | **34.48** | **10/10 AC (All Green)** | **~4.64x** 🚀 |
+| 3 | 2026-09-30 20:18 | hw1-3 | 64-byte aligned row strides, schedule(static, 4) interleaved chunks eliminating load imbalance | 34.48 | 10/10 AC | ~4.64x |
+| 4 | 2026-09-30 21:55 | hw1-3 | mmap 2MB Huge Pages, Parallel First-Touch NUMA, and Dead Computation Elimination | **26.45** | **10/10 AC (All Green ↓)** | **~6.05x** 🚀 |
 
 ---
 
