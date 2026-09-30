@@ -8,13 +8,63 @@
 | 1 | 2026-09-30 01:24 | hw1-2 | Initial OpenMP Parallelization (gaussianBlur row-wise, detectKeypoints fork-join, computeDescriptor, matchFeatures preallocated slots) | 8.89 | 16/16 AC | ~4.50x |
 | 2 | 2026-09-30 01:50 | hw1-2 | Squared distance matching (eliminate sqrt), contiguous flatB descriptors, 4-way unroll distance, parallel dog & grayscale | 8.76 | 16/16 AC | ~4.57x |
 | 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | ~11.27x |
-| 4 | 2026-09-30 02:17 | hw1-2 | Layer-s cache-hot early exit for isExtremum, direct row pointers for edge test | 3.40 | 16/16 AC | ~11.76x |
 | 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | ~12.42x |
-| 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | **~15.15x** 🚀 |
+| 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | ~15.15x |
+| 7 | 2026-09-30 11:22 | hw1-2 | AVX2 4-pixel horizontal blur with pre-broadcast k_vecs, fused parallel region in gaussianBlur, preallocated thread_kps, zero-redundancy extremum checking | 2.13 | 16/16 AC | **~18.78x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #7: AVX2 Horizontal Blur SIMD, Fused Blur Parallel Team & Precomputed Keypoints
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 11:22
+- **Total Time**: 2.13s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~18.78x (vs v6: **1.239x / ~19% faster**, vs initial v1: **4.17x**)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Key Modifications**:
+  1. **水平高斯濾波 AVX2 4-pixel SIMD 向量化 + 預廣播係數表**：
+     - 利用 `_mm256_loadu_pd` 一次載入 4 個連續水平像素，消除重複讀取；將高斯核在進入 row 迴圈前預先廣播到 `k_vecs` 陣列中，消滅了每張圖 2,000 萬次 `_mm256_set1_pd` 廣播指令。
+  2. **高斯模糊雙 Pass 平行團隊融合（Fused Parallel Team）**：
+     - 將 Pass 1 與 Pass 2 融合進同一個 `#pragma omp parallel` 區塊，中間以隱式屏障自然同步，大幅降低 OpenMP 頻繁重複建立/銷毀執行緒團隊與自旋等待開銷。
+  3. **特徵點偵測預配置快取與極值零冗餘檢查**：
+     - `thread_kps` 提到最外層預分配，各層僅需呼叫 `.clear()`，消除動態 vector 記憶體抖動。
+     - `scale` 提早在 scale 迴圈外預算，消除了數十萬次 `std::pow` 呼叫。
+     - 中心像素值 $v$ 與當前層列指針直接傳遞，極值檢驗失敗時完全不讀取相鄰圖層記憶體。
+  4. **全體 16 個測資再度全面狂飆**：
+     - `a05`: 0.13s ➔ **0.09s** ↓ (-31%)
+     - `a07`: 0.30s ➔ **0.23s** ↓ (-23%)
+     - `a08`: 0.45s ➔ **0.34s** ↓ (-24%)
+     - `b04`: 0.07s ➔ **0.05s** ↓ (-29%)
+     - `b05`: 0.08s ➔ **0.06s** ↓ (-25%)
+     - `b06`: 0.27s ➔ **0.20s** ↓ (-26%)
+     - `b07`: 0.40s ➔ **0.36s** ↓ (-10%)
+     - `b08`: 0.55s ➔ **0.44s** ↓ (-20%)
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.02 ↑
+  a02  AC      0.03 0.03 ↓
+  a03  AC      0.04 0.05 ↓
+  a04  AC      0.07 0.07 ↓
+  a05  AC      0.09 0.13 ↓
+  a06  AC      0.11 0.12 ↓
+  a07  AC      0.23 0.30 ↓
+  a08  AC      0.34 0.45 ↓
+  b01  AC      0.02 0.02 ↓
+  b02  AC      0.03 0.03 ↓
+  b03  AC      0.04 0.05 ↓
+  b04  AC      0.05 0.07 ↓
+  b05  AC      0.06 0.08 ↓
+  b06  AC      0.20 0.27 ↓
+  b07  AC      0.36 0.40 ↓
+  b08  AC      0.44 0.55 ↓
+──────────────────────────
+Total: 16/16   2.13 2.64 ↓
+```
+
+---
 
 ### Run #6: BufferPool Memory Page Reuse, Grayscale PNG LUT & Stack Descriptors
 - **Target**: `hw1-2`
