@@ -137,12 +137,8 @@ int main(int argc, char** argv) {
     double step_energy = 0.0;
 
     if (threshold <= 0.0) {
-        double final_energy = 0.0;
 #pragma omp parallel
         {
-            double* cur_u = u;
-            double* cur_unew = unew;
-
             for (int s = 0; s < T; s++) {
 #pragma omp for schedule(static, 1)
                 for (long i = 1; i <= N; i++) {
@@ -165,11 +161,11 @@ int main(int argc, char** argv) {
                             const long jm_SJ = (j - 1) * SJ;
                             const long jp_SJ = (j + 1) * SJ;
 
-                            const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
+                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                            const double* __restrict__ uim = &u[im_SI + j_SJ];
+                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
 
                             const double* __restrict__ ac  = &a[i_SI + j_SJ];
                             const double* __restrict__ aim = &a[im_SI + j_SJ];
@@ -177,7 +173,7 @@ int main(int argc, char** argv) {
                             const double* __restrict__ ajm = &a[i_SI + jm_SJ];
                             const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                            double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
+                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
                             #pragma GCC ivdep
                             for (long k = 1; k <= N; k++) {
@@ -210,11 +206,11 @@ int main(int argc, char** argv) {
                             const long jm_SJ = (j - 1) * SJ;
                             const long jp_SJ = (j + 1) * SJ;
 
-                            const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
-                            const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
-                            const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
-                            const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
-                            const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
+                            const double* __restrict__ uc  = &u[i_SI + j_SJ];
+                            const double* __restrict__ uim = &u[im_SI + j_SJ];
+                            const double* __restrict__ uip = &u[ip_SI + j_SJ];
+                            const double* __restrict__ ujm = &u[i_SI + jm_SJ];
+                            const double* __restrict__ ujp = &u[i_SI + jp_SJ];
 
                             const double* __restrict__ ac  = &a[i_SI + j_SJ];
                             const double* __restrict__ aim = &a[im_SI + j_SJ];
@@ -222,7 +218,7 @@ int main(int argc, char** argv) {
                             const double* __restrict__ ajm = &a[i_SI + jm_SJ];
                             const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                            double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
+                            double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
                             if (n_act == 0) {
                                 #pragma GCC ivdep
@@ -260,23 +256,25 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                std::swap(cur_u, cur_unew);
-            }
 
-#pragma omp for schedule(static, 1) reduction(+:final_energy)
-            for (long i = 1; i <= N; i++) {
-                const long i_SI = i * SI;
-                for (long j = 1; j <= N; j++) {
-                    const double* __restrict__ u_row = &cur_u[i_SI + j * SJ];
-                    for (long k = 1; k <= N; k++) {
-                        final_energy += u_row[k] * u_row[k];
-                    }
+#pragma omp single
+                {
+                    std::swap(u, unew);
                 }
             }
         }
         steps = T;
-        if (T % 2 != 0) {
-            std::swap(u, unew);
+
+        double final_energy = 0.0;
+#pragma omp parallel for schedule(static, 1) reduction(+:final_energy)
+        for (long i = 1; i <= N; i++) {
+            const long i_SI = i * SI;
+            for (long j = 1; j <= N; j++) {
+                const double* __restrict__ u_row = &u[i_SI + j * SJ];
+                for (long k = 1; k <= N; k++) {
+                    final_energy += u_row[k] * u_row[k];
+                }
+            }
         }
         energy = final_energy;
     } else {
@@ -421,8 +419,6 @@ int main(int argc, char** argv) {
 
     FILE* out = fopen(argv[5], "w");
     if (!out) return 1;
-    char out_buf[1 << 20];
-    setvbuf(out, out_buf, _IOFBF, sizeof(out_buf));
     fprintf(out, "%ld %d\n%.17g\n", N, steps, energy);
     for (int si = 0; si < 32; si++)
         for (int sj = 0; sj < 32; sj++)
