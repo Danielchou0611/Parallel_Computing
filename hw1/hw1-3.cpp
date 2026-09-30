@@ -8,8 +8,6 @@
 #include <vector>
 #include <omp.h>
 #include <sys/mman.h>
-#include <sched.h>
-#include <pthread.h>
 
 // ========== START: DO NOT CHANGE BELOW ==========
 static const double R = 0.5;    // the reaction's strength
@@ -67,26 +65,6 @@ struct RowSphere {
     double rem_r2;
 };
 
-static void pin_threads() {
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    if (sched_getaffinity(0, sizeof(cpu_set_t), &allowed) != 0) return;
-    std::vector<int> cpus;
-    for (int c = 0; c < CPU_SETSIZE; c++) {
-        if (CPU_ISSET(c, &allowed)) cpus.push_back(c);
-    }
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        if (tid < (int)cpus.size()) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(cpus[tid], &cpuset);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-        }
-    }
-}
-
 int main(int argc, char** argv) {
     if (argc != 6) return 1;
     const long N = atol(argv[1]);
@@ -130,8 +108,6 @@ int main(int argc, char** argv) {
     memset(&u[(M - 1) * SI], 0, SI * sizeof(double));
     memset(&unew[(M - 1) * SI], 0, SI * sizeof(double));
     memset(&a[(M - 1) * SI], 0, SI * sizeof(double));
-
-    pin_threads();
 
     // Parallel first-touch: exactly matching simulation loop (i = 1 .. N, schedule(static, 1))
     // Guarantees perfect NUMA node and cache affinity between threads and their memory pages
