@@ -12,16 +12,62 @@
 | 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | ~15.15x |
 | 7 | 2026-09-30 11:22 | hw1-2 | AVX2 4-pixel horizontal blur with pre-broadcast k_vecs, fused parallel region in gaussianBlur, preallocated thread_kps, zero-redundancy extremum checking | 2.13 | 16/16 AC | ~18.78x |
 | 8 | 2026-09-30 12:40 | hw1-2 | Precomputed static Gaussian kernels, decoupled full-team multithreaded grayscale, 8-tap vertical blur row accumulation, DogSlice extremum branching, dual-accumulator AVX2 horizontal blur | 2.04 | 16/16 AC | ~19.61x |
-| 9 | 2026-09-30 13:10 | hw1-2 | Fused DoG in vertical blur Pass 2, streaming row-by-row PNG decode, single outer parallel region in detectKeypoints | 2.02 | 16/16 AC | **~19.80x** 🚀 |
+| 9 | 2026-09-30 13:10 | hw1-2 | Fused DoG in vertical blur Pass 2, streaming row-by-row PNG decode, single outer parallel region in detectKeypoints | 2.02 | 16/16 AC | ~19.80x |
+| 10 | 2026-09-30 16:13 | hw1-2 | Compile-time templated runScale, edge test division elimination, descriptor distance early exit, 64-byte aligned BufferPool | 1.80 | 16/16 AC | **~22.22x** 🚀 |
 
 ---
 
 ## Detailed Records
 
+### Run #10: Templated runScale, Edge Division Elimination, Descriptor Early-Exit
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 16:13
+- **Total Time**: 1.80s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~22.22x (vs v9: **1.122x faster**, 12.2% reduction!)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Backup File**: `hw1-2_v10_1.80s.cpp`
+- **Key Modifications**:
+  1. **編譯期模板化 `runScale<S>`**：消除迴圈內的動態指標切換與分支，內聯核心處理。
+  2. **邊界測試無除法化（Edge Test Division Elimination）**：將 Hessian 矩陣邊緣過濾公式轉換為純乘法比較，消除除法延遲。
+  3. **特徵匹配早期截斷（Descriptor Distance Early Exit）**：在平方距離累加時若已超過當前第二小距離立即 break。
+  4. **64-Byte 對齊 BufferPool**：消除 AVX2/AVX-512 cross-cache-line split penalties。
+  5. **大幅降速測資**：
+     - `a08`: 0.33s ➔ **0.27s** (↓ 60ms!)
+     - `b08`: 0.42s ➔ **0.35s** (↓ 70ms!)
+     - `a06`: 0.10s ➔ **0.08s** (↓ 20ms!)
+     - `b06`: 0.21s ➔ **0.19s** (↓ 20ms!)
+     - `a01`: 0.02s ➔ **0.01s**
+     - `b01`: 0.02s ➔ **0.01s**
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.01 0.02 ↓
+  a02  AC      0.04 0.03 ↑
+  a04  AC      0.05 0.06 ↓
+  a03  AC      0.04 0.04 ↓
+  a05  AC      0.08 0.09 ↓
+  a06  AC      0.08 0.10 ↓
+  a07  AC      0.22 0.22 ↓
+  a08  AC      0.27 0.33 ↓
+  b01  AC      0.01 0.02 ↓
+  b02  AC      0.02 0.02 ↑
+  b03  AC      0.03 0.03 ↓
+  b04  AC      0.05 0.06 ↓
+  b05  AC      0.06 0.06 ↑
+  b06  AC      0.19 0.21 ↓
+  b07  AC      0.29 0.30 ↓
+  b08  AC      0.35 0.42 ↓
+──────────────────────────
+Total: 16/16   1.80 2.02 ↓
+```
+
+---
+
 ### Run #9: Fused DoG in Pass 2, Streaming PNG Decode, Outer Parallel DetectKeypoints
 - **Target**: `hw1-2`
 - **Date**: 2026-09-30 13:10
-- **Total Time**: 2.02s (16/16 AC) — **New Best!**
+- **Total Time**: 2.02s (16/16 AC)
 - **Speedup vs Baseline**: ~19.80x (vs v8: **1.010x faster**)
 - **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
 - **Backup File**: `hw1-2_v9_2.02s.cpp`
