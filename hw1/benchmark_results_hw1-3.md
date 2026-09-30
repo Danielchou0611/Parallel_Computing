@@ -9,7 +9,8 @@
 | 2 | 2026-09-30 18:23 | hw1-3 | Hoisted 1D row pointers, 2-level sphere bounding-box peeling (slice/row level) | ~36.2s | Local pass | ~4.4x |
 | 3 | 2026-09-30 20:18 | hw1-3 | 64-byte aligned row strides, schedule(static, 4) interleaved chunks eliminating load imbalance | 34.48 | 10/10 AC | ~4.64x |
 | 4 | 2026-09-30 21:55 | hw1-3 | mmap 2MB Huge Pages, Parallel First-Touch NUMA, and Dead Computation Elimination | 26.45 | 10/10 AC | ~6.05x |
-| 5 | 2026-09-30 22:07 | hw1-3 | schedule(static, 1) fine-grained round-robin sphere load balancing (Rank 59) | **22.43** | **10/10 AC (Rank 59)** | **~7.13x** 🚀 |
+| 5 | 2026-09-30 22:07 | hw1-3 | schedule(static, 1) fine-grained round-robin sphere load balancing (Rank 59) | 22.43 | 10/10 AC (Rank 59) | ~7.13x |
+| 6 | 2026-09-30 22:41 | hw1-3 | Row-level sphere filtering and fine-tuned distribution (Rank 55) | **21.21** | **10/10 AC (Rank 55)** | **~7.54x** 🚀 |
 
 ---
 
