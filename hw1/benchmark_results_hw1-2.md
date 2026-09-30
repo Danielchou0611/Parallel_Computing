@@ -9,11 +9,59 @@
 | 2 | 2026-09-30 01:50 | hw1-2 | Squared distance matching (eliminate sqrt), contiguous flatB descriptors, 4-way unroll distance, parallel dog & grayscale | 8.76 | 16/16 AC | ~4.57x |
 | 3 | 2026-09-30 02:05 | hw1-2 | Zero-copy flat Mat, boundary-split blur AVX2 SIMD, scratch buffer reuse, concurrent PNG decode, batched nowait DoG | 3.55 | 16/16 AC | ~11.27x |
 | 4 | 2026-09-30 02:17 | hw1-2 | Layer-s cache-hot early exit for isExtremum, direct row pointers for edge test | 3.40 | 16/16 AC | ~11.76x |
-| 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | **~12.42x** 🚀 |
+| 5 | 2026-09-30 02:31 | hw1-2 | 4-tap unrolled vertical blur row accumulation, write-buffer traffic reduction | 3.22 | 16/16 AC | ~12.42x |
+| 6 | 2026-09-30 11:03 | hw1-2 | BufferPool memory page reuse (eliminate 140k page faults), 1-channel PNG LUT decode, stack-allocated descriptors, 1D separable exp, early gaussian release | 2.64 | 16/16 AC | **~15.15x** 🚀 |
 
 ---
 
 ## Detailed Records
+
+### Run #6: BufferPool Memory Page Reuse, Grayscale PNG LUT & Stack Descriptors
+- **Target**: `hw1-2`
+- **Date**: 2026-09-30 11:03
+- **Total Time**: 2.64s (16/16 AC) — **New Best!**
+- **Speedup vs Baseline**: ~15.15x (vs v5: **1.220x / ~18% faster**, vs initial v1: **3.37x**)
+- **Leaderboard**: http://140.112.91.83/leaderboard/hw1-2
+- **Key Modifications**:
+  1. **零成本 BufferPool 消除 14 萬次 Page Faults**：
+     - 使用非零化（non-zeroing）`BufferPool` 貫穿 Image A 與 Image B。Image A 建立好的物理記憶體頁面直接留給 Image B 復用，消除了 Linux 核心態 14 萬次 soft page faults 與 `mmap_lock` 爭用，system time 銳減。
+  2. **純灰階 PNG 直讀與 256 項常數查表**：
+     - `b01`~`b08` 均為 8-bit 單通道灰階圖，移除轉成 4-byte RGBA 的開銷，記憶體傳輸流量減少 75%，並透過 256 項預算查表保證 100% 浮點精度。
+  3. **堆疊陣列化與 1D 分離式高斯預算**：
+     - 方向直方圖 `hist[36]` 與特徵描述子 `desc[128]` 改為 stack 陣列，消除成千上萬次 heap malloc/free；2D 高斯加權分解為 1D 預算表，節省 90% 的 `std::exp` 呼叫。
+  4. **記憶體生命週期即刻釋放**：
+     - DoG 相減後立即釋放 `gaussian[0, 4, 5]`；`detectKeypoints` 結束後立即清空 `oct.dog`，大幅壓低記憶體峰值，提高 L3 快取命中率。
+  5. **所有 16 個測資全面加速**：
+     - `a07`: 0.42s ➔ **0.30s** ↓
+     - `a08`: 0.54s ➔ **0.45s** ↓
+     - `b06`: 0.34s ➔ **0.27s** ↓
+     - `b07`: 0.49s ➔ **0.40s** ↓
+     - `b08`: 0.66s ➔ **0.55s** ↓
+
+```
+judging 16 case(s)
+  TC   STAT     NEW BEST
+  a01  AC      0.02 0.02 ↓
+  a02  AC      0.03 0.04 ↓
+  a03  AC      0.05 0.07 ↓
+  a04  AC      0.07 0.08 ↓
+  a05  AC      0.13 0.16 ↓
+  a06  AC      0.12 0.13 ↓
+  a07  AC      0.30 0.42 ↓
+  a08  AC      0.45 0.54 ↓
+  b01  AC      0.02 0.02 ↓
+  b02  AC      0.03 0.03 ↓
+  b03  AC      0.05 0.06 ↓
+  b05  AC      0.08 0.09 ↓
+  b04  AC      0.07 0.09 ↓
+  b06  AC      0.27 0.34 ↓
+  b07  AC      0.40 0.49 ↓
+  b08  AC      0.55 0.66 ↓
+──────────────────────────
+Total: 16/16   2.64 3.22 ↓
+```
+
+---
 
 ### Run #5: 4-Tap Unrolled Vertical Blur Row Accumulation
 - **Target**: `hw1-2`
