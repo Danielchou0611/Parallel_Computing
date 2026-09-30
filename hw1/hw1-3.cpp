@@ -419,6 +419,8 @@ int main(int argc, char** argv) {
 
     FILE* out = fopen(argv[5], "w");
     if (!out) return 1;
+    char out_buf[1 << 20];
+    setvbuf(out, out_buf, _IOFBF, sizeof(out_buf));
     fprintf(out, "%ld %d\n%.17g\n", N, steps, energy);
     for (int si = 0; si < 32; si++)
         for (int sj = 0; sj < 32; sj++)
