@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     double energy0 = 0.0;
 
     // Parallel first-touch: initialize halo and interior in parallel
-#pragma omp parallel for schedule(static, 4) reduction(+:energy0)
+#pragma omp parallel for schedule(static, 1) reduction(+:energy0)
     for (long i = 0; i < M; i++) {
         const long i_SI = i * SI;
         if (i == 0 || i == M - 1) {
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
 #pragma omp parallel
         {
             for (int s = 0; s < T; s++) {
-#pragma omp for schedule(static, 4)
+#pragma omp for schedule(static, 1)
                 for (long i = 1; i <= N; i++) {
                     bool slice_has_sphere = false;
                     for (int b = 0; b < B; b++) {
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
         steps = T;
 
         double final_energy = 0.0;
-#pragma omp parallel for schedule(static, 4) reduction(+:final_energy)
+#pragma omp parallel for schedule(static, 1) reduction(+:final_energy)
         for (long i = 1; i <= N; i++) {
             const long i_SI = i * SI;
             for (long j = 1; j <= N; j++) {
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
 #pragma omp parallel
         {
             while (steps < T) {
-#pragma omp for schedule(static, 4) reduction(+:step_energy)
+#pragma omp for schedule(static, 1) reduction(+:step_energy)
                 for (long i = 1; i <= N; i++) {
                     bool slice_has_sphere = false;
                     for (int b = 0; b < B; b++) {
