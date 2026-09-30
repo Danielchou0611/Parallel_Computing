@@ -181,13 +181,13 @@ int main(int argc, char** argv) {
                         }
                     } else {
                         for (long j = 1; j <= N; j++) {
-                            bool row_has_sphere = false;
+                            int act_b[4];
+                            int n_act = 0;
                             for (int b = 0; b < B; b++) {
                                 const double di = i - inc[b].ci;
                                 const double dj = j - inc[b].cj;
                                 if (di * di + dj * dj <= inc[b].r2) {
-                                    row_has_sphere = true;
-                                    break;
+                                    act_b[n_act++] = b;
                                 }
                             }
 
@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
 
                             double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
-                            if (!row_has_sphere) {
+                            if (n_act == 0) {
                                 #pragma GCC ivdep
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
@@ -231,7 +231,16 @@ int main(int argc, char** argv) {
                                                       + (ap + ac[k - 1]) * (uc[k - 1] - up)
                                                       + (ap + ac[k + 1]) * (uc[k + 1] - up);
                                     const double r = up + flux * (1.0 / 12.0);
-                                    unew_row[k] = reactive(inc, B, i, j, k) ? react(r) : r;
+                                    bool is_react = false;
+                                    for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                        const int b = act_b[a_idx];
+                                        const double di = i - inc[b].ci, dj = j - inc[b].cj, dk = k - inc[b].ck;
+                                        if (di * di + dj * dj + dk * dk <= inc[b].r2) {
+                                            is_react = true;
+                                            break;
+                                        }
+                                    }
+                                    unew_row[k] = is_react ? react(r) : r;
                                 }
                             }
                         }
