@@ -1,0 +1,44 @@
+diff --git a/hw1-3.cpp b/hw1-3.cpp
+--- a/hw1-3.cpp
++++ b/hw1-3.cpp
+@@
+ #include <omp.h>
++#include <sched.h>
+ #include <sys/mman.h>
+@@
+-static inline __attribute__((always_inline))
++static inline
+ double field_preseed(uint64_t seed_mix, uint64_t index, int which) noexcept {
+@@
+-        #pragma omp simd
++        // Let GCC vectorize when profitable.  omp simd forces a SIMD version;
++        // on Ice Lake Xeon the uint64_t multiplies can make that slower.
++        #pragma GCC ivdep
+         for (long k = 1; k <= N; k++) {
+             row[k] = field_preseed(seed_mix, base + (uint64_t)(k - 1), 1);
+         }
+@@
+ int main(int argc, char** argv) {
+     if (argc != 6) return 1;
++
++    // The judge grants 2, 4, or 8 CPUs through the process affinity mask.
++    // Do not let OpenMP create threads for all CPUs visible on the node.
++    cpu_set_t allowed_cpus;
++    CPU_ZERO(&allowed_cpus);
++    int worker_count = 1;
++    if (sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0) {
++        worker_count = CPU_COUNT(&allowed_cpus);
++        if (worker_count < 1) worker_count = 1;
++    }
++    omp_set_dynamic(0);
++    omp_set_num_threads(worker_count);
++
+     const long N = atol(argv[1]);
+@@
+-    const int BJ = 16;
++    // Public measurements show BJ=16 works well for N=512, while the larger
++    // low-memory cases regress because their per-thread slab working set grows.
++    // Keep the smaller tile from N=640 upward.  Both choices leave enough
++    // tiles for the judge's maximum of eight workers.
++    const int BJ = (N >= 640) ? 8 : 16;
+     const int BJ_STORED = 32;

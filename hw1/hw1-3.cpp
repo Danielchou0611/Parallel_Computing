@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <omp.h>
+#include <sched.h>
 #include <sys/mman.h>
 
 // ========== START: DO NOT CHANGE BELOW ==========
@@ -63,7 +64,7 @@ static double react(double r) {
 
 // Same bit-for-bit field calculation, but with seed * GOLDEN_GAMMA
 // precomputed once outside the hot loops.
-static inline __attribute__((always_inline))
+static inline
 double field_preseed(uint64_t seed_mix, uint64_t index, int which) noexcept {
     uint64_t x = (index * 2 + static_cast<uint64_t>(which)) ^ seed_mix;
     x += 0x9E3779B97F4A7C15ull;
@@ -97,7 +98,9 @@ static void gen_a_slab(double* __restrict__ dst, long i, long j0, long j1,
         row[0] = 0.0;
         row[N + 1] = 0.0;
         const uint64_t base = ((uint64_t)(i - 1) * N + (j - 1)) * N;
-        #pragma omp simd
+        // Let GCC vectorize when profitable.  omp simd forces a SIMD version;
+        // on Ice Lake Xeon the uint64_t multiplies can make that slower.
+        #pragma GCC ivdep
         for (long k = 1; k <= N; k++) {
             row[k] = field_preseed(seed_mix, base + (uint64_t)(k - 1), 1);
         }
@@ -270,6 +273,19 @@ static double lowmem_tile(const double* __restrict__ cur_u,
 
 int main(int argc, char** argv) {
     if (argc != 6) return 1;
+
+    // The judge grants 2, 4, or 8 CPUs through the process affinity mask.
+    // Do not let OpenMP create threads for all CPUs visible on the node.
+    cpu_set_t allowed_cpus;
+    CPU_ZERO(&allowed_cpus);
+    int worker_count = 1;
+    if (sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0) {
+        worker_count = CPU_COUNT(&allowed_cpus);
+        if (worker_count < 1) worker_count = 1;
+    }
+    omp_set_dynamic(0);
+    omp_set_num_threads(worker_count);
+
     const long N = atol(argv[1]);
     const int T = atoi(argv[2]);
     const uint64_t seed = strtoull(argv[3], nullptr, 10);
@@ -372,7 +388,11 @@ int main(int argc, char** argv) {
     int steps = 0;
     const double threshold = theta * energy0;
     double step_energy = 0.0;
-    const int BJ = 16;
+    // Public measurements show BJ=16 works well for N=512, while the larger
+    // low-memory cases regress because their per-thread slab working set grows.
+    // Keep the smaller tile from N=640 upward.  Both choices leave enough
+    // tiles for the judge's maximum of eight workers.
+    const int BJ = (N >= 640) ? 8 : 16;
     const int BJ_STORED = 32;
 
     if (!store_a) {
