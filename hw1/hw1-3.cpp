@@ -61,6 +61,16 @@ static double react(double r) {
 }
 // =========== END: DO NOT CHANGE ABOVE ===========
 
+static inline __attribute__((always_inline))
+double field_preseed(uint64_t seed_mix, uint64_t index, int which) {
+    uint64_t x = (index * 2 + static_cast<uint64_t>(which)) ^ seed_mix;
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return static_cast<double>(x >> 11) * (1.0 / 9007199254740992.0);
+}
+
 struct RowSphere {
     double ck;
     double rem_r2;
@@ -72,6 +82,7 @@ int main(int argc, char** argv) {
     const int T = atoi(argv[2]);
     const uint64_t seed = strtoull(argv[3], nullptr, 10);
     const double theta = atof(argv[4]);
+    const uint64_t seed_mix = seed * 0x9E3779B97F4A7C15ull;
 
     const long M = N + 2;
     const long SJ = (M + 7) & ~7L;
@@ -132,9 +143,9 @@ int main(int argc, char** argv) {
             const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
             for (long k = 1; k <= N; k++) {
                 const uint64_t index = base_idx + (k - 1);
-                const double u_val = field(seed, index, 0);
+                const double u_val = field_preseed(seed_mix, index, 0);
                 u_row[k] = u_val;
-                a_row[k] = field(seed, index, 1);
+                a_row[k] = field_preseed(seed_mix, index, 1);
                 energy0 += u_val * u_val;
             }
         }
