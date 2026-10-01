@@ -17,10 +17,7 @@ elif [ "$TARGET" = "hw1-2" ]; then
         hw1-2-judge "b$tc"
     done
 elif [ "$TARGET" = "hw1-3" ]; then
-    for i in {1..10}; do
-        tc=$(printf "%02d" $i)
-        hw1-3-judge "p$tc"
-    done
+    hw1-3-judge
 else
     echo "Unknown target: $TARGET (use hw1-1, hw1-2, or hw1-3)"
 fi
