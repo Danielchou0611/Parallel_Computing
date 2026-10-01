@@ -196,18 +196,32 @@ int main(int argc, char** argv) {
 
                                 double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
-                                #pragma GCC ivdep
-                                for (long k = 1; k <= N; k++) {
-                                    const double up = uc[k], ap = ac[k];
-                                    const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                      + (ap + aip[k]) * (uip[k] - up)
-                                                      + (ap + ajm[k]) * (ujm[k] - up)
-                                                      + (ap + ajp[k]) * (ujp[k] - up)
-                                                      + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                      + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                    const double val = up + flux * (1.0 / 12.0);
-                                    unew_row[k] = val;
-                                    if (is_last) thread_final_energy += val * val;
+                                if (!is_last) {
+                                    #pragma omp simd
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        unew_row[k] = up + flux * (1.0 / 12.0);
+                                    }
+                                } else {
+                                    #pragma omp simd reduction(+:thread_final_energy)
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double val = up + flux * (1.0 / 12.0);
+                                        unew_row[k] = val;
+                                        thread_final_energy += val * val;
+                                    }
                                 }
                             }
                         }
@@ -244,18 +258,32 @@ int main(int argc, char** argv) {
 
                                 double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
-                                #pragma GCC ivdep
-                                for (long k = 1; k <= N; k++) {
-                                    const double up = uc[k], ap = ac[k];
-                                    const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                      + (ap + aip[k]) * (uip[k] - up)
-                                                      + (ap + ajm[k]) * (ujm[k] - up)
-                                                      + (ap + ajp[k]) * (ujp[k] - up)
-                                                      + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                      + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                    const double val = up + flux * (1.0 / 12.0);
-                                    unew_row[k] = val;
-                                    if (is_last) thread_final_energy += val * val;
+                                if (!is_last) {
+                                    #pragma omp simd
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        unew_row[k] = up + flux * (1.0 / 12.0);
+                                    }
+                                } else {
+                                    #pragma omp simd reduction(+:thread_final_energy)
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double val = up + flux * (1.0 / 12.0);
+                                        unew_row[k] = val;
+                                        thread_final_energy += val * val;
+                                    }
                                 }
                             }
                         } else {
@@ -292,18 +320,32 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
                                 if (n_act == 0) {
-                                    #pragma GCC ivdep
-                                    for (long k = 1; k <= N; k++) {
-                                        const double up = uc[k], ap = ac[k];
-                                        const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                          + (ap + aip[k]) * (uip[k] - up)
-                                                          + (ap + ajm[k]) * (ujm[k] - up)
-                                                          + (ap + ajp[k]) * (ujp[k] - up)
-                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                        const double val = up + flux * (1.0 / 12.0);
-                                        unew_row[k] = val;
-                                        if (is_last) thread_final_energy += val * val;
+                                    if (!is_last) {
+                                        #pragma omp simd
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            unew_row[k] = up + flux * (1.0 / 12.0);
+                                        }
+                                    } else {
+                                        #pragma omp simd reduction(+:thread_final_energy)
+                                        for (long k = 1; k <= N; k++) {
+                                            const double up = uc[k], ap = ac[k];
+                                            const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                              + (ap + aip[k]) * (uip[k] - up)
+                                                              + (ap + ajm[k]) * (ujm[k] - up)
+                                                              + (ap + ajp[k]) * (ujp[k] - up)
+                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                            const double val = up + flux * (1.0 / 12.0);
+                                            unew_row[k] = val;
+                                            thread_final_energy += val * val;
+                                        }
                                     }
                                 } else {
                                     for (long k = 1; k <= N; k++) {
@@ -381,7 +423,7 @@ int main(int argc, char** argv) {
 
                                 double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
-                                #pragma GCC ivdep
+                                #pragma omp simd reduction(+:thread_step_energy)
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -446,7 +488,7 @@ int main(int argc, char** argv) {
 
                                 double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
-                                #pragma GCC ivdep
+                                #pragma omp simd reduction(+:step_energy)
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -494,7 +536,7 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
                                 if (n_act == 0) {
-                                    #pragma GCC ivdep
+                                    #pragma omp simd reduction(+:step_energy)
                                     for (long k = 1; k <= N; k++) {
                                         const double up = uc[k], ap = ac[k];
                                         const double flux = (ap + aim[k]) * (uim[k] - up)
