@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <omp.h>
 #include <sys/mman.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 // ========== START: DO NOT CHANGE BELOW ==========
 static const double R = 0.5;    // the reaction's strength
@@ -111,8 +114,207 @@ static inline int build_reaction_intervals(const RowSphere* act, int n_act, long
     return merged;
 }
 
+// ---------------------------------------------------------------- low memory slab
+static void gen_a_slab(double* __restrict__ dst, long i, long j0, long j1,
+                       long N, long SJ, uint64_t seed) {
+    const long rows = j1 - j0 + 3;
+    if (i < 1 || i > N) {
+        memset(dst, 0, (size_t)rows * SJ * sizeof(double));
+        return;
+    }
+    for (long t = 0; t < rows; t++) {
+        const long j = j0 - 1 + t;
+        double* row = dst + t * SJ;
+        if (j < 1 || j > N) {
+            memset(row, 0, (size_t)SJ * sizeof(double));
+            continue;
+        }
+        row[0] = 0.0;
+        row[N + 1] = 0.0;
+        const uint64_t base = ((uint64_t)(i - 1) * N + (j - 1)) * N;
+        #pragma GCC ivdep
+        for (long k = 1; k <= N; k++) row[k] = field(seed, base + (k - 1), 1);
+    }
+}
+
+template<bool NEED_ENERGY>
+static double lowmem_tile(const double* __restrict__ cur_u,
+                          double* __restrict__ cur_unew,
+                          long j0, long j1, long N, long SI, long SJ,
+                          uint64_t seed, const Inclusion* inc, int B,
+                          const char* slice_has_sphere, double* slab) {
+    const long rows = j1 - j0 + 3;
+    const size_t plane = (size_t)rows * SJ;
+    double* ap[3] = {slab, slab + plane, slab + 2 * plane};
+
+    gen_a_slab(ap[0], 0, j0, j1, N, SJ, seed);
+    gen_a_slab(ap[1], 1, j0, j1, N, SJ, seed);
+    gen_a_slab(ap[2], 2, j0, j1, N, SJ, seed);
+
+    double energy = 0.0;
+
+    for (long i = 1; i <= N; i++) {
+        const long i_SI = i * SI, im_SI = (i - 1) * SI, ip_SI = (i + 1) * SI;
+        const bool sph = (B > 0) && slice_has_sphere[i];
+
+        if (!sph) {
+            for (long j = j0; j <= j1; j++) {
+                const long t = j - j0 + 1;
+                const long j_SJ = j * SJ, jm_SJ = (j - 1) * SJ, jp_SJ = (j + 1) * SJ;
+
+                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
+                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
+                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
+                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
+                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+
+                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(ap[1] + t * SJ, 64);
+                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(ap[0] + t * SJ, 64);
+                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(ap[2] + t * SJ, 64);
+                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(ap[1] + (t - 1) * SJ, 64);
+                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(ap[1] + (t + 1) * SJ, 64);
+
+                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+
+                #pragma GCC ivdep
+                #pragma GCC unroll 4
+                for (long k = 1; k <= N; k++) {
+                    const double up = uc[k], apv = ac[k];
+                    const double flux = (apv + aim[k]) * (uim[k] - up)
+                                      + (apv + aip[k]) * (uip[k] - up)
+                                      + (apv + ajm[k]) * (ujm[k] - up)
+                                      + (apv + ajp[k]) * (ujp[k] - up)
+                                      + (apv + ac[k - 1]) * (uc[k - 1] - up)
+                                      + (apv + ac[k + 1]) * (uc[k + 1] - up);
+                    const double val = up + flux * (1.0 / 12.0);
+                    unew_row[k] = val;
+                    if (NEED_ENERGY) energy += val * val;
+                }
+            }
+        } else {
+            for (long j = j0; j <= j1; j++) {
+                const long t = j - j0 + 1;
+                const long j_SJ = j * SJ, jm_SJ = (j - 1) * SJ, jp_SJ = (j + 1) * SJ;
+
+                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
+                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
+                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
+                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
+                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+
+                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(ap[1] + t * SJ, 64);
+                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(ap[0] + t * SJ, 64);
+                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(ap[2] + t * SJ, 64);
+                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(ap[1] + (t - 1) * SJ, 64);
+                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(ap[1] + (t + 1) * SJ, 64);
+
+                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+
+                RowSphere act[4];
+                int n_act = 0;
+                for (int b = 0; b < B; b++) {
+                    const double di = i - inc[b].ci, dj = j - inc[b].cj;
+                    const double d2 = di * di + dj * dj;
+                    if (d2 <= inc[b].r2) {
+                        act[n_act].ck = inc[b].ck;
+                        act[n_act].rem_r2 = inc[b].r2 - d2;
+                        n_act++;
+                    }
+                }
+
+                if (n_act == 0) {
+                    #pragma GCC ivdep
+                    for (long k = 1; k <= N; k++) {
+                        const double up = uc[k], apv = ac[k];
+                        const double flux = (apv + aim[k]) * (uim[k] - up)
+                                          + (apv + aip[k]) * (uip[k] - up)
+                                          + (apv + ajm[k]) * (ujm[k] - up)
+                                          + (apv + ajp[k]) * (ujp[k] - up)
+                                          + (apv + ac[k - 1]) * (uc[k - 1] - up)
+                                          + (apv + ac[k + 1]) * (uc[k + 1] - up);
+                        const double val = up + flux * (1.0 / 12.0);
+                        unew_row[k] = val;
+                        if (NEED_ENERGY) energy += val * val;
+                    }
+                } else {
+                    KInterval intervals[4];
+                    const int n_intervals = build_reaction_intervals(act, n_act, N, intervals);
+                    long cur_k = 1;
+                    for (int iv = 0; iv < n_intervals; iv++) {
+                        if (intervals[iv].lo > cur_k) {
+                            #pragma GCC ivdep
+                            #pragma GCC unroll 4
+                            for (long k = cur_k; k < intervals[iv].lo; k++) {
+                                const double up = uc[k], apv = ac[k];
+                                const double flux = (apv + aim[k]) * (uim[k] - up)
+                                                  + (apv + aip[k]) * (uip[k] - up)
+                                                  + (apv + ajm[k]) * (ujm[k] - up)
+                                                  + (apv + ajp[k]) * (ujp[k] - up)
+                                                  + (apv + ac[k - 1]) * (uc[k - 1] - up)
+                                                  + (apv + ac[k + 1]) * (uc[k + 1] - up);
+                                const double val = up + flux * (1.0 / 12.0);
+                                unew_row[k] = val;
+                                if (NEED_ENERGY) energy += val * val;
+                            }
+                        }
+                        for (long k = intervals[iv].lo; k <= intervals[iv].hi; k++) {
+                            const double up = uc[k], apv = ac[k];
+                            const double flux = (apv + aim[k]) * (uim[k] - up)
+                                              + (apv + aip[k]) * (uip[k] - up)
+                                              + (apv + ajm[k]) * (ujm[k] - up)
+                                              + (apv + ajp[k]) * (ujp[k] - up)
+                                              + (apv + ac[k - 1]) * (uc[k - 1] - up)
+                                              + (apv + ac[k + 1]) * (uc[k + 1] - up);
+                            const double r = up + flux * (1.0 / 12.0);
+                            const double val = react(r);
+                            unew_row[k] = val;
+                            if (NEED_ENERGY) energy += val * val;
+                        }
+                        cur_k = intervals[iv].hi + 1;
+                    }
+                    if (cur_k <= N) {
+                        #pragma GCC ivdep
+                        #pragma GCC unroll 4
+                        for (long k = cur_k; k <= N; k++) {
+                            const double up = uc[k], apv = ac[k];
+                            const double flux = (apv + aim[k]) * (uim[k] - up)
+                                              + (apv + aip[k]) * (uip[k] - up)
+                                              + (apv + ajm[k]) * (ujm[k] - up)
+                                              + (apv + ajp[k]) * (ujp[k] - up)
+                                              + (apv + ac[k - 1]) * (uc[k - 1] - up)
+                                              + (apv + ac[k + 1]) * (uc[k + 1] - up);
+                            const double val = up + flux * (1.0 / 12.0);
+                            unew_row[k] = val;
+                            if (NEED_ENERGY) energy += val * val;
+                        }
+                    }
+                }
+            }
+        }
+
+        double* tmp = ap[0]; ap[0] = ap[1]; ap[1] = ap[2]; ap[2] = tmp;
+        gen_a_slab(ap[2], i + 2, j0, j1, N, SJ, seed);
+    }
+    return energy;
+}
+
 int main(int argc, char** argv) {
     if (argc != 6) return 1;
+
+#ifdef __linux__
+    if (getenv("OMP_NUM_THREADS") == nullptr) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            int ncpus = CPU_COUNT(&cpuset);
+            if (ncpus < 1) ncpus = 1;
+            if (ncpus > 8) ncpus = 8;
+            omp_set_num_threads(ncpus);
+        }
+    }
+#endif
+
+
     const long N = atol(argv[1]);
     const int T = atoi(argv[2]);
     const uint64_t seed = strtoull(argv[3], nullptr, 10);
@@ -124,12 +326,19 @@ int main(int argc, char** argv) {
     const size_t total_elements = (size_t)M * SI;
     const size_t total_bytes = total_elements * sizeof(double);
 
+    const bool store_a = (N <= 384);
+
     double* u = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     double* unew = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    double* a = (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    double* a = store_a ? (double*)mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                        : nullptr;
+    if (u == MAP_FAILED || unew == MAP_FAILED || (store_a && a == MAP_FAILED)) {
+        fprintf(stderr, "out of memory for N = %ld\n", N);
+        return 1;
+    }
     madvise(u, total_bytes, MADV_HUGEPAGE);
     madvise(unew, total_bytes, MADV_HUGEPAGE);
-    madvise(a, total_bytes, MADV_HUGEPAGE);
+    if (store_a) madvise(a, total_bytes, MADV_HUGEPAGE);
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
@@ -148,22 +357,32 @@ int main(int argc, char** argv) {
         }
     }
 
-#pragma omp parallel for schedule(static, 1) reduction(+:energy0)
+#pragma omp parallel for schedule(static) reduction(+:energy0)
     for (long i = 1; i <= N; i++) {
         const long i_SI = i * SI;
         for (long j = 1; j <= N; j++) {
             const long j_SJ = j * SJ;
             double* u_row = &u[i_SI + j_SJ];
-            double* a_row = &a[i_SI + j_SJ];
             const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
-            #pragma GCC ivdep
-            #pragma GCC unroll 4
-            for (long k = 1; k <= N; k++) {
-                const uint64_t index = base_idx + (k - 1);
-                const double u_val = field(seed, index, 0);
-                u_row[k] = u_val;
-                a_row[k] = field(seed, index, 1);
-                energy0 += u_val * u_val;
+            if (store_a) {
+                double* a_row = &a[i_SI + j_SJ];
+                #pragma GCC ivdep
+                #pragma GCC unroll 4
+                for (long k = 1; k <= N; k++) {
+                    const uint64_t index = base_idx + (k - 1);
+                    const double u_val = field(seed, index, 0);
+                    u_row[k] = u_val;
+                    a_row[k] = field(seed, index, 1);
+                    energy0 += u_val * u_val;
+                }
+            } else {
+                #pragma GCC ivdep
+                #pragma GCC unroll 4
+                for (long k = 1; k <= N; k++) {
+                    const double u_val = field(seed, base_idx + (k - 1), 0);
+                    u_row[k] = u_val;
+                    energy0 += u_val * u_val;
+                }
             }
         }
     }
@@ -172,9 +391,84 @@ int main(int argc, char** argv) {
     int steps = 0;
     const double threshold = theta * energy0;
     double step_energy = 0.0;
-    const int BJ = (N <= 128) ? 16 : 32;
+    const int BJ = 12;
+    const int BJ_STORED = (N <= 128) ? 16 : ((N <= 256) ? 32 : 24);
+    if (!store_a) {
+        const long ntiles = (N + BJ - 1) / BJ;
+        if (threshold <= 0.0) {
+            double final_energy = 0.0;
+#pragma omp parallel
+            {
+                std::vector<double> slab(3 * (size_t)(BJ + 2) * SJ);
+                double* cur_u = u;
+                double* cur_unew = unew;
+                double thread_final_energy = 0.0;
 
-    if (threshold <= 0.0) {
+                for (int s = 0; s < T; s++) {
+                    const bool is_last = (s == T - 1);
+                    if (is_last) {
+#pragma omp for schedule(static, 1)
+                        for (long jt = 0; jt < ntiles; jt++) {
+                            const long j0 = 1 + jt * BJ;
+                            const long j1 = std::min(N, j0 + BJ - 1);
+                            thread_final_energy += lowmem_tile<true>(
+                                cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
+                                inc, B, slice_has_sphere.data(), slab.data());
+                        }
+                    } else {
+#pragma omp for schedule(static, 1)
+                        for (long jt = 0; jt < ntiles; jt++) {
+                            const long j0 = 1 + jt * BJ;
+                            const long j1 = std::min(N, j0 + BJ - 1);
+                            lowmem_tile<false>(
+                                cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
+                                inc, B, slice_has_sphere.data(), slab.data());
+                        }
+                    }
+                    std::swap(cur_u, cur_unew);
+                }
+
+#pragma omp atomic
+                final_energy += thread_final_energy;
+            }
+            if (T % 2 == 1) std::swap(u, unew);
+            steps = T;
+            energy = (T == 0) ? energy0 : final_energy;
+        } else {
+#pragma omp parallel
+            {
+                std::vector<double> slab(3 * (size_t)(BJ + 2) * SJ);
+                double* cur_u = u;
+                double* cur_unew = unew;
+
+                while (steps < T) {
+                    double te = 0.0;
+#pragma omp for schedule(static, 1) nowait
+                    for (long jt = 0; jt < ntiles; jt++) {
+                        const long j0 = 1 + jt * BJ;
+                        const long j1 = std::min(N, j0 + BJ - 1);
+                        te += lowmem_tile<true>(
+                            cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
+                            inc, B, slice_has_sphere.data(), slab.data());
+                    }
+#pragma omp atomic
+                    step_energy += te;
+
+#pragma omp barrier
+#pragma omp single
+                    {
+                        steps++;
+                        energy = step_energy;
+                        step_energy = 0.0;
+                    }
+                    std::swap(cur_u, cur_unew);
+                    if (energy <= threshold) break;
+                }
+            }
+            if (steps % 2 == 1) std::swap(u, unew);
+        }
+    } else if (threshold <= 0.0) {
+        // High-efficiency stored_a for N <= 256 with threshold <= 0
         double final_energy = 0.0;
 #pragma omp parallel
         {
@@ -183,12 +477,11 @@ int main(int argc, char** argv) {
             double thread_final_energy = 0.0;
 
             if (B == 0) {
-                // Pure diffusion: Static J-cache-tiling with i sweeping
                 for (int s = 0; s < T; s++) {
                     const bool is_last = (s == T - 1);
 #pragma omp for schedule(static)
-                    for (long j_start = 1; j_start <= N; j_start += BJ) {
-                        const long j_end = std::min(N, j_start + BJ - 1);
+                    for (long j_start = 1; j_start <= N; j_start += BJ_STORED) {
+                        const long j_end = std::min(N, j_start + BJ_STORED - 1);
                         for (long i = 1; i <= N; i++) {
                             const long i_SI = i * SI;
                             const long im_SI = (i - 1) * SI;
@@ -214,7 +507,6 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -233,7 +525,6 @@ int main(int argc, char** argv) {
                     std::swap(cur_u, cur_unew);
                 }
             } else {
-                // Sphere cases: schedule(static, 1) balanced cyclic distribution
                 for (int s = 0; s < T; s++) {
                     const bool is_last = (s == T - 1);
 #pragma omp for schedule(static, 1)
@@ -263,7 +554,6 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -312,7 +602,6 @@ int main(int argc, char** argv) {
 
                                 if (n_act == 0) {
                                     #pragma GCC ivdep
-                                    #pragma GCC unroll 4
                                     for (long k = 1; k <= N; k++) {
                                         const double up = uc[k], ap = ac[k];
                                         const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -327,12 +616,12 @@ int main(int argc, char** argv) {
                                     }
                                 } else {
                                     KInterval intervals[4];
-                                    const int n_intervals = build_reaction_intervals(act_spheres, n_act, N, intervals);
+                                    const int n_intervals = build_reaction_intervals(
+                                        act_spheres, n_act, N, intervals);
                                     long cur_k = 1;
                                     for (int iv = 0; iv < n_intervals; iv++) {
                                         if (intervals[iv].lo > cur_k) {
                                             #pragma GCC ivdep
-                                            #pragma GCC unroll 4
                                             for (long k = cur_k; k < intervals[iv].lo; k++) {
                                                 const double up = uc[k], ap = ac[k];
                                                 const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -363,7 +652,6 @@ int main(int argc, char** argv) {
                                     }
                                     if (cur_k <= N) {
                                         #pragma GCC ivdep
-                                        #pragma GCC unroll 4
                                         for (long k = cur_k; k <= N; k++) {
                                             const double up = uc[k], ap = ac[k];
                                             const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -392,11 +680,10 @@ int main(int argc, char** argv) {
             std::swap(u, unew);
         }
         steps = T;
-        energy = final_energy;
+        energy = (T == 0) ? energy0 : final_energy;
     } else {
-        // threshold > 0.0 cases
+        // N <= 384 with threshold > 0 cases (e.g. p05)
         if (B == 0) {
-            // Pure diffusion early-exit with Static J-cache-tiling
 #pragma omp parallel
             {
                 double* cur_u = u;
@@ -405,8 +692,8 @@ int main(int argc, char** argv) {
                 while (steps < T) {
                     double thread_step_energy = 0.0;
 #pragma omp for schedule(static)
-                    for (long j_start = 1; j_start <= N; j_start += BJ) {
-                        const long j_end = std::min(N, j_start + BJ - 1);
+                    for (long j_start = 1; j_start <= N; j_start += BJ_STORED) {
+                        const long j_end = std::min(N, j_start + BJ_STORED - 1);
                         for (long i = 1; i <= N; i++) {
                             const long i_SI = i * SI;
                             const long im_SI = (i - 1) * SI;
@@ -432,7 +719,6 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -498,7 +784,6 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -547,7 +832,6 @@ int main(int argc, char** argv) {
 
                                 if (n_act == 0) {
                                     #pragma GCC ivdep
-                                    #pragma GCC unroll 4
                                     for (long k = 1; k <= N; k++) {
                                         const double up = uc[k], ap = ac[k];
                                         const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -562,12 +846,12 @@ int main(int argc, char** argv) {
                                     }
                                 } else {
                                     KInterval intervals[4];
-                                    const int n_intervals = build_reaction_intervals(act_spheres, n_act, N, intervals);
+                                    const int n_intervals = build_reaction_intervals(
+                                        act_spheres, n_act, N, intervals);
                                     long cur_k = 1;
                                     for (int iv = 0; iv < n_intervals; iv++) {
                                         if (intervals[iv].lo > cur_k) {
                                             #pragma GCC ivdep
-                                            #pragma GCC unroll 4
                                             for (long k = cur_k; k < intervals[iv].lo; k++) {
                                                 const double up = uc[k], ap = ac[k];
                                                 const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -598,7 +882,6 @@ int main(int argc, char** argv) {
                                     }
                                     if (cur_k <= N) {
                                         #pragma GCC ivdep
-                                        #pragma GCC unroll 4
                                         for (long k = cur_k; k <= N; k++) {
                                             const double up = uc[k], ap = ac[k];
                                             const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -645,6 +928,6 @@ int main(int argc, char** argv) {
     fclose(out);
     munmap(u, total_bytes);
     munmap(unew, total_bytes);
-    munmap(a, total_bytes);
+    if (store_a) munmap(a, total_bytes);
     return 0;
 }

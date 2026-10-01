@@ -1,9 +1,8 @@
 # HW1-3 Optimization Summary & Progression Log
 
 ## Current Status (2026-10-01)
-- **Official SEIREN Leaderboard Best**: **20.91s** (10/10 AC)
-- **Local Testbench Total Time**: **13.579s** (10/10 AC)
-- **Git Branch**: `hw1` (Head commit: `f3f2bd0`)
+- **Official SEIREN Leaderboard Best**: **20.91s** (10/10 AC, pre-Run #8)
+- **Local Testbench Total Time**: **10.180s** (10/10 AC, Run #8)
 - **Numerical Accuracy**: 100% verified (energy error $\le 10^{-10}$, sample error $0.00$).
 
 ---
