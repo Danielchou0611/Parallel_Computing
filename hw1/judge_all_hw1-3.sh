@@ -1,3 +1,7 @@
 #!/bin/bash
-# 直接執行一次評測全部測資（只編譯一次，且會自動登記至排行榜）
-hw1-3-judge "$@"
+
+echo "=== Judging HW1-3: p01 ~ p10 ==="
+for i in {1..10}; do
+    tc=$(printf "%02d" $i)
+    hw1-3-judge "p$tc"
+done
