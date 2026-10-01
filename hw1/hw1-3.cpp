@@ -66,51 +66,6 @@ struct RowSphere {
     double rem_r2;
 };
 
-struct KInterval {
-    long lo, hi;
-};
-
-static inline int build_reaction_intervals(const RowSphere* act, int n_act, long N,
-                                           KInterval* intervals) {
-    int n = 0;
-    for (int b = 0; b < n_act; b++) {
-        const double half = sqrt(act[b].rem_r2);
-        long lo = (long)floor(act[b].ck - half);
-        long hi = (long)ceil(act[b].ck + half);
-        if (lo < 1) lo = 1;
-        if (hi > N) hi = N;
-        while (lo <= hi) {
-            const double dk = lo - act[b].ck;
-            if (dk * dk <= act[b].rem_r2) break;
-            lo++;
-        }
-        while (hi >= lo) {
-            const double dk = hi - act[b].ck;
-            if (dk * dk <= act[b].rem_r2) break;
-            hi--;
-        }
-        if (lo > hi) continue;
-
-        int pos = n;
-        while (pos > 0 && intervals[pos - 1].lo > lo) {
-            intervals[pos] = intervals[pos - 1];
-            pos--;
-        }
-        intervals[pos] = {lo, hi};
-        n++;
-    }
-
-    int merged = 0;
-    for (int i = 0; i < n; i++) {
-        if (merged == 0 || intervals[i].lo > intervals[merged - 1].hi + 1) {
-            intervals[merged++] = intervals[i];
-        } else if (intervals[i].hi > intervals[merged - 1].hi) {
-            intervals[merged - 1].hi = intervals[i].hi;
-        }
-    }
-    return merged;
-}
-
 int main(int argc, char** argv) {
     if (argc != 6) return 1;
     const long N = atol(argv[1]);
@@ -148,16 +103,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    memset(&u[0], 0, SI * sizeof(double));
+    memset(&unew[0], 0, SI * sizeof(double));
+    memset(&a[0], 0, SI * sizeof(double));
+    memset(&u[(M - 1) * SI], 0, SI * sizeof(double));
+    memset(&unew[(M - 1) * SI], 0, SI * sizeof(double));
+    memset(&a[(M - 1) * SI], 0, SI * sizeof(double));
+
 #pragma omp parallel for schedule(static, 1) reduction(+:energy0)
     for (long i = 1; i <= N; i++) {
         const long i_SI = i * SI;
+        memset(&u[i_SI], 0, SJ * sizeof(double));
+        memset(&unew[i_SI], 0, SJ * sizeof(double));
+        memset(&a[i_SI], 0, SJ * sizeof(double));
+        memset(&u[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+        memset(&unew[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+        memset(&a[i_SI + (M - 1) * SJ], 0, SJ * sizeof(double));
+
         for (long j = 1; j <= N; j++) {
             const long j_SJ = j * SJ;
             double* u_row = &u[i_SI + j_SJ];
+            double* unew_row = &unew[i_SI + j_SJ];
             double* a_row = &a[i_SI + j_SJ];
+            u_row[0] = 0.0; u_row[N + 1] = 0.0;
+            unew_row[0] = 0.0; unew_row[N + 1] = 0.0;
+            a_row[0] = 0.0; a_row[N + 1] = 0.0;
+
             const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
-            #pragma GCC ivdep
-            #pragma GCC unroll 4
             for (long k = 1; k <= N; k++) {
                 const uint64_t index = base_idx + (k - 1);
                 const double u_val = field(seed, index, 0);
@@ -172,7 +144,7 @@ int main(int argc, char** argv) {
     int steps = 0;
     const double threshold = theta * energy0;
     double step_energy = 0.0;
-    const int BJ = (N <= 128) ? 16 : 32;
+    const int BJ = 32;
 
     if (threshold <= 0.0) {
         double final_energy = 0.0;
@@ -199,22 +171,21 @@ int main(int argc, char** argv) {
                                 const long jm_SJ = (j - 1) * SJ;
                                 const long jp_SJ = (j + 1) * SJ;
 
-                                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
-                                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
-                                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(&a[i_SI + j_SJ], 64);
-                                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(&a[im_SI + j_SJ], 64);
-                                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(&a[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(&a[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(&a[i_SI + jp_SJ], 64);
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -248,22 +219,21 @@ int main(int argc, char** argv) {
                                 const long jm_SJ = (j - 1) * SJ;
                                 const long jp_SJ = (j + 1) * SJ;
 
-                                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
-                                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
-                                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(&a[i_SI + j_SJ], 64);
-                                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(&a[im_SI + j_SJ], 64);
-                                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(&a[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(&a[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(&a[i_SI + jp_SJ], 64);
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -296,23 +266,22 @@ int main(int argc, char** argv) {
                                 const long jm_SJ = (j - 1) * SJ;
                                 const long jp_SJ = (j + 1) * SJ;
 
-                                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
-                                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
-                                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(&a[i_SI + j_SJ], 64);
-                                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(&a[im_SI + j_SJ], 64);
-                                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(&a[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(&a[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(&a[i_SI + jp_SJ], 64);
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
                                 if (n_act == 0) {
                                     #pragma GCC ivdep
-                                    #pragma GCC unroll 4
                                     for (long k = 1; k <= N; k++) {
                                         const double up = uc[k], ap = ac[k];
                                         const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -326,56 +295,26 @@ int main(int argc, char** argv) {
                                         if (is_last) thread_final_energy += val * val;
                                     }
                                 } else {
-                                    KInterval intervals[4];
-                                    const int n_intervals = build_reaction_intervals(act_spheres, n_act, N, intervals);
-                                    long cur_k = 1;
-                                    for (int iv = 0; iv < n_intervals; iv++) {
-                                        if (intervals[iv].lo > cur_k) {
-                                            #pragma GCC ivdep
-                                            #pragma GCC unroll 4
-                                            for (long k = cur_k; k < intervals[iv].lo; k++) {
-                                                const double up = uc[k], ap = ac[k];
-                                                const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                                  + (ap + aip[k]) * (uip[k] - up)
-                                                                  + (ap + ajm[k]) * (ujm[k] - up)
-                                                                  + (ap + ajp[k]) * (ujp[k] - up)
-                                                                  + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                                  + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                                const double val = up + flux * (1.0 / 12.0);
-                                                unew_row[k] = val;
-                                                if (is_last) thread_final_energy += val * val;
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        bool is_react = false;
+                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                            const double dk = k - act_spheres[a_idx].ck;
+                                            if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                is_react = true;
+                                                break;
                                             }
                                         }
-                                        for (long k = intervals[iv].lo; k <= intervals[iv].hi; k++) {
-                                            const double up = uc[k], ap = ac[k];
-                                            const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                              + (ap + aip[k]) * (uip[k] - up)
-                                                              + (ap + ajm[k]) * (ujm[k] - up)
-                                                              + (ap + ajp[k]) * (ujp[k] - up)
-                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                            const double r = up + flux * (1.0 / 12.0);
-                                            const double val = react(r);
-                                            unew_row[k] = val;
-                                            if (is_last) thread_final_energy += val * val;
-                                        }
-                                        cur_k = intervals[iv].hi + 1;
-                                    }
-                                    if (cur_k <= N) {
-                                        #pragma GCC ivdep
-                                        #pragma GCC unroll 4
-                                        for (long k = cur_k; k <= N; k++) {
-                                            const double up = uc[k], ap = ac[k];
-                                            const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                              + (ap + aip[k]) * (uip[k] - up)
-                                                              + (ap + ajm[k]) * (ujm[k] - up)
-                                                              + (ap + ajp[k]) * (ujp[k] - up)
-                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                            const double val = up + flux * (1.0 / 12.0);
-                                            unew_row[k] = val;
-                                            if (is_last) thread_final_energy += val * val;
-                                        }
+                                        const double val = is_react ? react(r) : r;
+                                        unew_row[k] = val;
+                                        if (is_last) thread_final_energy += val * val;
                                     }
                                 }
                             }
@@ -417,22 +356,21 @@ int main(int argc, char** argv) {
                                 const long jm_SJ = (j - 1) * SJ;
                                 const long jp_SJ = (j + 1) * SJ;
 
-                                const double* __restrict__ uc  = (const double*)__builtin_assume_aligned(&cur_u[i_SI + j_SJ], 64);
-                                const double* __restrict__ uim = (const double*)__builtin_assume_aligned(&cur_u[im_SI + j_SJ], 64);
-                                const double* __restrict__ uip = (const double*)__builtin_assume_aligned(&cur_u[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ujm = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ujp = (const double*)__builtin_assume_aligned(&cur_u[i_SI + jp_SJ], 64);
+                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
+                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
+                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
+                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
+                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
 
-                                const double* __restrict__ ac  = (const double*)__builtin_assume_aligned(&a[i_SI + j_SJ], 64);
-                                const double* __restrict__ aim = (const double*)__builtin_assume_aligned(&a[im_SI + j_SJ], 64);
-                                const double* __restrict__ aip = (const double*)__builtin_assume_aligned(&a[ip_SI + j_SJ], 64);
-                                const double* __restrict__ ajm = (const double*)__builtin_assume_aligned(&a[i_SI + jm_SJ], 64);
-                                const double* __restrict__ ajp = (const double*)__builtin_assume_aligned(&a[i_SI + jp_SJ], 64);
+                                const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                const double* __restrict__ aip = &a[ip_SI + j_SJ];
+                                const double* __restrict__ ajm = &a[i_SI + jm_SJ];
+                                const double* __restrict__ ajp = &a[i_SI + jp_SJ];
 
-                                double* __restrict__ unew_row = (double*)__builtin_assume_aligned(&cur_unew[i_SI + j_SJ], 64);
+                                double* __restrict__ unew_row = &cur_unew[i_SI + j_SJ];
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -498,7 +436,6 @@ int main(int argc, char** argv) {
                                 double* __restrict__ unew_row = &unew[i_SI + j_SJ];
 
                                 #pragma GCC ivdep
-                                #pragma GCC unroll 4
                                 for (long k = 1; k <= N; k++) {
                                     const double up = uc[k], ap = ac[k];
                                     const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -547,7 +484,6 @@ int main(int argc, char** argv) {
 
                                 if (n_act == 0) {
                                     #pragma GCC ivdep
-                                    #pragma GCC unroll 4
                                     for (long k = 1; k <= N; k++) {
                                         const double up = uc[k], ap = ac[k];
                                         const double flux = (ap + aim[k]) * (uim[k] - up)
@@ -561,56 +497,26 @@ int main(int argc, char** argv) {
                                         step_energy += val * val;
                                     }
                                 } else {
-                                    KInterval intervals[4];
-                                    const int n_intervals = build_reaction_intervals(act_spheres, n_act, N, intervals);
-                                    long cur_k = 1;
-                                    for (int iv = 0; iv < n_intervals; iv++) {
-                                        if (intervals[iv].lo > cur_k) {
-                                            #pragma GCC ivdep
-                                            #pragma GCC unroll 4
-                                            for (long k = cur_k; k < intervals[iv].lo; k++) {
-                                                const double up = uc[k], ap = ac[k];
-                                                const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                                  + (ap + aip[k]) * (uip[k] - up)
-                                                                  + (ap + ajm[k]) * (ujm[k] - up)
-                                                                  + (ap + ajp[k]) * (ujp[k] - up)
-                                                                  + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                                  + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                                const double val = up + flux * (1.0 / 12.0);
-                                                unew_row[k] = val;
-                                                step_energy += val * val;
+                                    for (long k = 1; k <= N; k++) {
+                                        const double up = uc[k], ap = ac[k];
+                                        const double flux = (ap + aim[k]) * (uim[k] - up)
+                                                          + (ap + aip[k]) * (uip[k] - up)
+                                                          + (ap + ajm[k]) * (ujm[k] - up)
+                                                          + (ap + ajp[k]) * (ujp[k] - up)
+                                                          + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                          + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                        const double r = up + flux * (1.0 / 12.0);
+                                        bool is_react = false;
+                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                            const double dk = k - act_spheres[a_idx].ck;
+                                            if (dk * dk <= act_spheres[a_idx].rem_r2) {
+                                                is_react = true;
+                                                break;
                                             }
                                         }
-                                        for (long k = intervals[iv].lo; k <= intervals[iv].hi; k++) {
-                                            const double up = uc[k], ap = ac[k];
-                                            const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                              + (ap + aip[k]) * (uip[k] - up)
-                                                              + (ap + ajm[k]) * (ujm[k] - up)
-                                                              + (ap + ajp[k]) * (ujp[k] - up)
-                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                            const double r = up + flux * (1.0 / 12.0);
-                                            const double val = react(r);
-                                            unew_row[k] = val;
-                                            step_energy += val * val;
-                                        }
-                                        cur_k = intervals[iv].hi + 1;
-                                    }
-                                    if (cur_k <= N) {
-                                        #pragma GCC ivdep
-                                        #pragma GCC unroll 4
-                                        for (long k = cur_k; k <= N; k++) {
-                                            const double up = uc[k], ap = ac[k];
-                                            const double flux = (ap + aim[k]) * (uim[k] - up)
-                                                              + (ap + aip[k]) * (uip[k] - up)
-                                                              + (ap + ajm[k]) * (ujm[k] - up)
-                                                              + (ap + ajp[k]) * (ujp[k] - up)
-                                                              + (ap + ac[k - 1]) * (uc[k - 1] - up)
-                                                              + (ap + ac[k + 1]) * (uc[k + 1] - up);
-                                            const double val = up + flux * (1.0 / 12.0);
-                                            unew_row[k] = val;
-                                            step_energy += val * val;
-                                        }
+                                        const double val = is_react ? react(r) : r;
+                                        unew_row[k] = val;
+                                        step_energy += val * val;
                                     }
                                 }
                             }
