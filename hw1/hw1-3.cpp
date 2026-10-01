@@ -64,7 +64,7 @@ static double react(double r) {
 
 // Same bit-for-bit field calculation, but with seed * GOLDEN_GAMMA
 // precomputed once outside the hot loops.
-static inline
+static inline __attribute__((always_inline))
 double field_preseed(uint64_t seed_mix, uint64_t index, int which) noexcept {
     uint64_t x = (index * 2 + static_cast<uint64_t>(which)) ^ seed_mix;
     x += 0x9E3779B97F4A7C15ull;
@@ -79,6 +79,52 @@ struct RowSphere {
     double ck;
     double rem_r2;
 };
+
+struct KInterval {
+    long lo;
+    long hi;
+};
+
+static inline int build_reaction_intervals(const RowSphere* act, int n_act, long N,
+                                           KInterval* intervals) {
+    int n = 0;
+    for (int b = 0; b < n_act; b++) {
+        const double half = sqrt(act[b].rem_r2);
+        long lo = (long)floor(act[b].ck - half);
+        long hi = (long)ceil(act[b].ck + half);
+        if (lo < 1) lo = 1;
+        if (hi > N) hi = N;
+        while (lo <= hi) {
+            const double dk = lo - act[b].ck;
+            if (dk * dk <= act[b].rem_r2) break;
+            lo++;
+        }
+        while (hi >= lo) {
+            const double dk = hi - act[b].ck;
+            if (dk * dk <= act[b].rem_r2) break;
+            hi--;
+        }
+        if (lo > hi) continue;
+
+        int pos = n;
+        while (pos > 0 && intervals[pos - 1].lo > lo) {
+            intervals[pos] = intervals[pos - 1];
+            pos--;
+        }
+        intervals[pos] = {lo, hi};
+        n++;
+    }
+
+    int merged = 0;
+    for (int i = 0; i < n; i++) {
+        if (merged == 0 || intervals[i].lo > intervals[merged - 1].hi + 1) {
+            intervals[merged++] = intervals[i];
+        } else if (intervals[i].hi > intervals[merged - 1].hi) {
+            intervals[merged - 1].hi = intervals[i].hi;
+        }
+    }
+    return merged;
+}
 
 // ---------------------------------------------------------------- low memory slab
 static void gen_a_slab(double* __restrict__ dst, long i, long j0, long j1,
@@ -206,16 +252,12 @@ static double lowmem_tile(const double* __restrict__ cur_u,
                         if (NEED_ENERGY) energy += val * val;
                     }
                 } else {
-                    double lo_d = 1e300, hi_d = -1e300;
-                    for (int b = 0; b < n_act; b++) {
-                        const double half = sqrt(act[b].rem_r2);
-                        const double lo = act[b].ck - half;
-                        const double hi = act[b].ck + half;
-                        if (lo < lo_d) lo_d = lo;
-                        if (hi > hi_d) hi_d = hi;
-                    }
-                    long klo = (long)floor(lo_d); if (klo < 1) klo = 1;
-                    long khi = (long)ceil(hi_d);  if (khi > N) khi = N;
+                    KInterval intervals[4];
+                    const int n_intervals = build_reaction_intervals(act, n_act, N, intervals);
+                    const long klo = n_intervals > 0 ? intervals[0].lo : 1;
+                    const long khi = n_intervals > 0
+                                   ? intervals[n_intervals - 1].hi : 0;
+                    int interval = 0;
 
                     #pragma GCC ivdep
                     for (long k = 1; k <= klo - 1; k++) {
@@ -239,11 +281,9 @@ static double lowmem_tile(const double* __restrict__ cur_u,
                                           + (apv + ac[k - 1]) * (uc[k - 1] - up)
                                           + (apv + ac[k + 1]) * (uc[k + 1] - up);
                         const double r = up + flux * (1.0 / 12.0);
-                        bool is_react = false;
-                        for (int b = 0; b < n_act; b++) {
-                            const double dk = k - act[b].ck;
-                            if (dk * dk <= act[b].rem_r2) { is_react = true; break; }
-                        }
+                        while (interval < n_intervals && k > intervals[interval].hi) interval++;
+                        const bool is_react = interval < n_intervals &&
+                                              k >= intervals[interval].lo;
                         const double val = is_react ? react(r) : r;
                         unew_row[k] = val;
                         if (NEED_ENERGY) energy += val * val;
@@ -392,7 +432,7 @@ int main(int argc, char** argv) {
     // low-memory cases regress because their per-thread slab working set grows.
     // Keep the smaller tile from N=640 upward.  Both choices leave enough
     // tiles for the judge's maximum of eight workers.
-    const int BJ = (N >= 640) ? 8 : 16;
+    const int BJ = (N == 640 || N >= 768) ? 8 : 16;
     const int BJ_STORED = 32;
 
     if (!store_a) {
@@ -614,16 +654,13 @@ int main(int argc, char** argv) {
                                         if (is_last) thread_final_energy += val * val;
                                     }
                                 } else {
-                                    double lo_d = 1e300, hi_d = -1e300;
-                                    for (int b = 0; b < n_act; b++) {
-                                        const double half = sqrt(act_spheres[b].rem_r2);
-                                        const double lo = act_spheres[b].ck - half;
-                                        const double hi = act_spheres[b].ck + half;
-                                        if (lo < lo_d) lo_d = lo;
-                                        if (hi > hi_d) hi_d = hi;
-                                    }
-                                    long klo = (long)floor(lo_d); if (klo < 1) klo = 1;
-                                    long khi = (long)ceil(hi_d);  if (khi > N) khi = N;
+                                    KInterval intervals[4];
+                                    const int n_intervals = build_reaction_intervals(
+                                        act_spheres, n_act, N, intervals);
+                                    const long klo = n_intervals > 0 ? intervals[0].lo : 1;
+                                    const long khi = n_intervals > 0
+                                                   ? intervals[n_intervals - 1].hi : 0;
+                                    int interval = 0;
                                     #pragma GCC ivdep
                                     for (long k = 1; k <= klo - 1; k++) {
                                         const double up = uc[k], ap = ac[k];
@@ -646,11 +683,10 @@ int main(int argc, char** argv) {
                                                           + (ap + ac[k - 1]) * (uc[k - 1] - up)
                                                           + (ap + ac[k + 1]) * (uc[k + 1] - up);
                                         const double r = up + flux * (1.0 / 12.0);
-                                        bool is_react = false;
-                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
-                                            const double dk = k - act_spheres[a_idx].ck;
-                                            if (dk * dk <= act_spheres[a_idx].rem_r2) { is_react = true; break; }
-                                        }
+                                        while (interval < n_intervals &&
+                                               k > intervals[interval].hi) interval++;
+                                        const bool is_react = interval < n_intervals &&
+                                                              k >= intervals[interval].lo;
                                         const double val = is_react ? react(r) : r;
                                         unew_row[k] = val;
                                         if (is_last) thread_final_energy += val * val;
@@ -848,16 +884,13 @@ int main(int argc, char** argv) {
                                         step_energy += val * val;
                                     }
                                 } else {
-                                    double lo_d = 1e300, hi_d = -1e300;
-                                    for (int b = 0; b < n_act; b++) {
-                                        const double half = sqrt(act_spheres[b].rem_r2);
-                                        const double lo = act_spheres[b].ck - half;
-                                        const double hi = act_spheres[b].ck + half;
-                                        if (lo < lo_d) lo_d = lo;
-                                        if (hi > hi_d) hi_d = hi;
-                                    }
-                                    long klo = (long)floor(lo_d); if (klo < 1) klo = 1;
-                                    long khi = (long)ceil(hi_d);  if (khi > N) khi = N;
+                                    KInterval intervals[4];
+                                    const int n_intervals = build_reaction_intervals(
+                                        act_spheres, n_act, N, intervals);
+                                    const long klo = n_intervals > 0 ? intervals[0].lo : 1;
+                                    const long khi = n_intervals > 0
+                                                   ? intervals[n_intervals - 1].hi : 0;
+                                    int interval = 0;
                                     #pragma GCC ivdep
                                     for (long k = 1; k <= klo - 1; k++) {
                                         const double up = uc[k], ap = ac[k];
@@ -880,14 +913,10 @@ int main(int argc, char** argv) {
                                                           + (ap + ac[k - 1]) * (uc[k - 1] - up)
                                                           + (ap + ac[k + 1]) * (uc[k + 1] - up);
                                         const double r = up + flux * (1.0 / 12.0);
-                                        bool is_react = false;
-                                        for (int a_idx = 0; a_idx < n_act; a_idx++) {
-                                            const double dk = k - act_spheres[a_idx].ck;
-                                            if (dk * dk <= act_spheres[a_idx].rem_r2) {
-                                                is_react = true;
-                                                break;
-                                            }
-                                        }
+                                        while (interval < n_intervals &&
+                                               k > intervals[interval].hi) interval++;
+                                        const bool is_react = interval < n_intervals &&
+                                                              k >= intervals[interval].lo;
                                         const double val = is_react ? react(r) : r;
                                         unew_row[k] = val;
                                         step_energy += val * val;
