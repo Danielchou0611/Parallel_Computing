@@ -1,0 +1,166 @@
+diff --git a/main.cpp b/main.cpp
+--- a/main.cpp
++++ b/main.cpp
+@@ -55,6 +55,18 @@ static double react(double r) {
+ }
+ // =========== END: DO NOT CHANGE ABOVE ===========
+
++// Same bit-for-bit field calculation, but with seed * GOLDEN_GAMMA
++// precomputed once outside the hot loops.
++static inline __attribute__((always_inline))
++double field_preseed(uint64_t seed_mix, uint64_t index, int which) noexcept {
++    uint64_t x = (index * 2 + static_cast<uint64_t>(which)) ^ seed_mix;
++    x += 0x9E3779B97F4A7C15ull;
++    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
++    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
++    x ^= x >> 31;
++    return static_cast<double>(x >> 11) * 0x1.0p-53;
++}
++
+ struct RowSphere {
+     double ck;
+     double rem_r2;
+@@ -63,7 +75,7 @@ struct RowSphere {
+ // ---------------------------------------------------------------- low memory slab
+ static void gen_a_slab(double* __restrict__ dst, long i, long j0, long j1,
+-                       long N, long SJ, uint64_t seed) {
++                       long N, long SJ, uint64_t seed_mix) {
+     const long rows = j1 - j0 + 3;
+     if (i < 1 || i > N) {
+         memset(dst, 0, (size_t)rows * SJ * sizeof(double));
+@@ -80,8 +92,10 @@ static void gen_a_slab(double* __restrict__ dst, long i, long j0, long j1,
+         row[0] = 0.0;
+         row[N + 1] = 0.0;
+         const uint64_t base = ((uint64_t)(i - 1) * N + (j - 1)) * N;
+-        #pragma GCC ivdep
+-        for (long k = 1; k <= N; k++) row[k] = field(seed, base + (k - 1), 1);
++        #pragma omp simd
++        for (long k = 1; k <= N; k++) {
++            row[k] = field_preseed(seed_mix, base + (uint64_t)(k - 1), 1);
++        }
+     }
+ }
+
+@@ -89,14 +103,14 @@ template<bool NEED_ENERGY>
+ static double lowmem_tile(const double* __restrict__ cur_u,
+                           double* __restrict__ cur_unew,
+                           long j0, long j1, long N, long SI, long SJ,
+-                          uint64_t seed, const Inclusion* inc, int B,
++                          uint64_t seed_mix, const Inclusion* inc, int B,
+                           const char* slice_has_sphere, double* slab) {
+     const long rows = j1 - j0 + 3;
+     const size_t plane = (size_t)rows * SJ;
+     double* ap[3] = {slab, slab + plane, slab + 2 * plane};
+
+-    gen_a_slab(ap[0], 0, j0, j1, N, SJ, seed);
+-    gen_a_slab(ap[1], 1, j0, j1, N, SJ, seed);
+-    gen_a_slab(ap[2], 2, j0, j1, N, SJ, seed);
++    gen_a_slab(ap[0], 0, j0, j1, N, SJ, seed_mix);
++    gen_a_slab(ap[1], 1, j0, j1, N, SJ, seed_mix);
++    gen_a_slab(ap[2], 2, j0, j1, N, SJ, seed_mix);
+
+     double energy = 0.0;
+@@ -247,7 +261,7 @@ static double lowmem_tile(const double* __restrict__ cur_u,
+
+         double* tmp = ap[0]; ap[0] = ap[1]; ap[1] = ap[2]; ap[2] = tmp;
+-        gen_a_slab(ap[2], i + 2, j0, j1, N, SJ, seed);
++        gen_a_slab(ap[2], i + 2, j0, j1, N, SJ, seed_mix);
+     }
+     return energy;
+ }
+@@ -259,6 +273,8 @@ int main(int argc, char** argv) {
+     const int T = atoi(argv[2]);
+     const uint64_t seed = strtoull(argv[3], nullptr, 10);
+     const double theta = atof(argv[4]);
++    const uint64_t seed_mix =
++        seed * 0x9E3779B97F4A7C15ull;
+
+     const long M = N + 2;
+     const long SJ = (M + 7) & ~7L;
+@@ -312,7 +328,7 @@ int main(int argc, char** argv) {
+         }
+     }
+
+-#pragma omp parallel for schedule(static, 1) reduction(+:energy0)
++#pragma omp parallel for schedule(static) reduction(+:energy0)
+     for (long i = 1; i <= N; i++) {
+         const long i_SI = i * SI;
+         memset(&u[i_SI], 0, SJ * sizeof(double));
+@@ -337,20 +353,24 @@ int main(int argc, char** argv) {
+             const uint64_t base_idx = ((uint64_t)(i - 1) * N + (j - 1)) * N;
+             if (store_a) {
+                 double* a_row = &a[i_SI + j_SJ];
+                 a_row[0] = 0.0; a_row[N + 1] = 0.0;
++                double row_energy = 0.0;
++                #pragma omp simd reduction(+:row_energy)
+                 for (long k = 1; k <= N; k++) {
+                     const uint64_t index = base_idx + (k - 1);
+-                    const double u_val = field(seed, index, 0);
++                    const double u_val = field_preseed(seed_mix, index, 0);
+                     u_row[k] = u_val;
+-                    a_row[k] = field(seed, index, 1);
+-                    energy0 += u_val * u_val;
++                    a_row[k] = field_preseed(seed_mix, index, 1);
++                    row_energy += u_val * u_val;
+                 }
++                energy0 += row_energy;
+             } else {
++                double row_energy = 0.0;
++                #pragma omp simd reduction(+:row_energy)
+                 for (long k = 1; k <= N; k++) {
+-                    const double u_val = field(seed, base_idx + (k - 1), 0);
++                    const double u_val = field_preseed(seed_mix, base_idx + (k - 1), 0);
+                     u_row[k] = u_val;
+-                    energy0 += u_val * u_val;
++                    row_energy += u_val * u_val;
+                 }
++                energy0 += row_energy;
+             }
+         }
+     }
+@@ -378,7 +398,7 @@ int main(int argc, char** argv) {
+                             const long j0 = 1 + jt * BJ;
+                             const long j1 = std::min(N, j0 + BJ - 1);
+-                            thread_final_energy += lowmem_tile<true>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
++                            thread_final_energy += lowmem_tile<true>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed_mix,
+                                                                     inc, B, slice_has_sphere.data(), slab.data());
+                         }
+                     } else {
+@@ -387,7 +407,7 @@ int main(int argc, char** argv) {
+                             const long j0 = 1 + jt * BJ;
+                             const long j1 = std::min(N, j0 + BJ - 1);
+-                            lowmem_tile<false>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
++                            lowmem_tile<false>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed_mix,
+                                               inc, B, slice_has_sphere.data(), slab.data());
+                         }
+                     }
+@@ -417,7 +437,7 @@ int main(int argc, char** argv) {
+                         const long j0 = 1 + jt * BJ;
+                         const long j1 = std::min(N, j0 + BJ - 1);
+-                        te += lowmem_tile<true>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed,
++                        te += lowmem_tile<true>(cur_u, cur_unew, j0, j1, N, SI, SJ, seed_mix,
+                                                 inc, B, slice_has_sphere.data(), slab.data());
+                     }
+ #pragma omp atomic
+@@ -463,6 +483,12 @@ int main(int argc, char** argv) {
+                                 const long jm_SJ = (j - 1) * SJ;
+                                 const long jp_SJ = (j + 1) * SJ;
+
++                                const double* __restrict__ uc  = &cur_u[i_SI + j_SJ];
++                                const double* __restrict__ uim = &cur_u[im_SI + j_SJ];
++                                const double* __restrict__ uip = &cur_u[ip_SI + j_SJ];
++                                const double* __restrict__ ujm = &cur_u[i_SI + jm_SJ];
++                                const double* __restrict__ ujp = &cur_u[i_SI + jp_SJ];
++
+                                 const double* __restrict__ ac  = &a[i_SI + j_SJ];
+                                 const double* __restrict__ aim = &a[im_SI + j_SJ];
+                                 const double* __restrict__ aip = &a[ip_SI + j_SJ];
+@@ -804,7 +830,7 @@ int main(int argc, char** argv) {
+                                                           + (ap + ac[k - 1]) * (uc[k - 1] - up)
+                                                           + (ap + ac[k + 1]) * (uc[k + 1] - up);
+                                         const double r = up + flux * (1.0 / 12.0);
+-`                                        bool is_react = false;
++                                        bool is_react = false;
+                                         for (int a_idx = 0; a_idx < n_act; a_idx++) {
+                                             const double dk = k - act_spheres[a_idx].ck;
+                                             if (dk * dk <= act_spheres[a_idx].rem_r2) {
