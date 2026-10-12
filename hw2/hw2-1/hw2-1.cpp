@@ -562,11 +562,13 @@ void cooperative_dial(
     uint32_t current = 0;
 
     while (current != INF) {
+#if ENABLE_PROFILE
         stats.rounds++;
+        double tc0 = MPI_Wtime();
+#endif
         auto &my_bucket = local_buckets[current & 255u];
         uint64_t local_count = my_bucket.size();
 
-        double tc0 = MPI_Wtime();
         // 2. Prefix sum to merge local buckets into shared_frontier
         uint64_t my_offset = 0;
         MPI_Exscan(&local_count, &my_offset, 1, MPI_UINT64_T, MPI_SUM, team_comm);
@@ -574,10 +576,14 @@ void cooperative_dial(
 
         uint64_t total_count = 0;
         MPI_Allreduce(&local_count, &total_count, 1, MPI_UINT64_T, MPI_SUM, team_comm);
+#if ENABLE_PROFILE
         stats.collective_time += (MPI_Wtime() - tc0);
+#endif
 
         if (total_count > 0) {
+#if ENABLE_PROFILE
             stats.total_frontier += total_count;
+#endif
 
             if (local_count > 0) {
                 std::memcpy(shared_frontier + my_offset, my_bucket.data(), local_count * sizeof(uint32_t));
@@ -588,13 +594,17 @@ void cooperative_dial(
                 *shared_work_index = 0;
             }
 
+#if ENABLE_PROFILE
             double tc1 = MPI_Wtime();
+#endif
             MPI_Win_sync(win);
             MPI_Barrier(team_comm);
             MPI_Win_sync(win);
+#if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc1);
 
             double tr0 = MPI_Wtime();
+#endif
             // 3. Dynamic work chunk distribution across team ranks
 #if CHUNK_MODE == 1
             const uint64_t work_chunk = 64;
@@ -627,13 +637,17 @@ void cooperative_dial(
                     }
                 }
             }
+#if ENABLE_PROFILE
             stats.relax_time += (MPI_Wtime() - tr0);
 
             double tc2 = MPI_Wtime();
+#endif
             MPI_Win_sync(win);
             MPI_Barrier(team_comm);
             MPI_Win_sync(win);
+#if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc2);
+#endif
         } else {
             my_bucket.clear();
         }
@@ -648,10 +662,14 @@ void cooperative_dial(
             }
         }
 
+#if ENABLE_PROFILE
         double tc3 = MPI_Wtime();
+#endif
         uint32_t team_next = INF;
         MPI_Allreduce(&local_next, &team_next, 1, MPI_UINT32_T, MPI_MIN, team_comm);
+#if ENABLE_PROFILE
         stats.collective_time += (MPI_Wtime() - tc3);
+#endif
         current = team_next;
     }
 }
@@ -687,20 +705,26 @@ void cooperative_delta_stepping(
     uint32_t curr_bin = 0;
 
     while (curr_bin != INF) {
+#if ENABLE_PROFILE
         stats.rounds++;
+        double tc0 = MPI_Wtime();
+#endif
         uint64_t local_count = (curr_bin < local_bins.size()) ? local_bins[curr_bin].size() : 0;
 
-        double tc0 = MPI_Wtime();
         uint64_t my_offset = 0;
         MPI_Exscan(&local_count, &my_offset, 1, MPI_UINT64_T, MPI_SUM, team_comm);
         if (team_rank == 0) my_offset = 0;
 
         uint64_t total_count = 0;
         MPI_Allreduce(&local_count, &total_count, 1, MPI_UINT64_T, MPI_SUM, team_comm);
+#if ENABLE_PROFILE
         stats.collective_time += (MPI_Wtime() - tc0);
+#endif
 
         if (total_count > 0) {
+#if ENABLE_PROFILE
             stats.total_frontier += total_count;
+#endif
 
             if (local_count > 0) {
                 std::memcpy(shared_frontier + my_offset, local_bins[curr_bin].data(), local_count * sizeof(uint32_t));
@@ -711,13 +735,17 @@ void cooperative_delta_stepping(
                 *shared_work_index = 0;
             }
 
+#if ENABLE_PROFILE
             double tc1 = MPI_Wtime();
+#endif
             MPI_Win_sync(win);
             MPI_Barrier(team_comm);
             MPI_Win_sync(win);
+#if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc1);
 
             double tr0 = MPI_Wtime();
+#endif
 #if CHUNK_MODE == 1
             const uint64_t work_chunk = 64;
 #elif CHUNK_MODE == 2
@@ -750,13 +778,17 @@ void cooperative_delta_stepping(
                     }
                 }
             }
+#if ENABLE_PROFILE
             stats.relax_time += (MPI_Wtime() - tr0);
 
             double tc2 = MPI_Wtime();
+#endif
             MPI_Win_sync(win);
             MPI_Barrier(team_comm);
             MPI_Win_sync(win);
+#if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc2);
+#endif
         } else {
             // Find next non-empty bin
             uint32_t local_next = INF;
@@ -767,10 +799,14 @@ void cooperative_delta_stepping(
                 }
             }
 
+#if ENABLE_PROFILE
             double tc3 = MPI_Wtime();
+#endif
             uint32_t team_next = INF;
             MPI_Allreduce(&local_next, &team_next, 1, MPI_UINT32_T, MPI_MIN, team_comm);
+#if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc3);
+#endif
             curr_bin = team_next;
         }
     }
@@ -784,7 +820,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
+#if ENABLE_PROFILE
     double t0 = MPI_Wtime();
+#endif
 
     // 1. Create shared communicator for processes on the same node
     MPI_Comm shm_comm;
@@ -860,8 +898,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
 
+#if ENABLE_PROFILE
     double t_alloc = MPI_Wtime() - t0;
     double t1 = MPI_Wtime();
+#endif
 
     // 3. Parallel Graph Construction
     const uint64_t edge_begin = (M * static_cast<uint64_t>(shm_rank)) / shm_size;
@@ -940,7 +980,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
 
+#if ENABLE_PROFILE
     double t_pass1 = MPI_Wtime() - t1;
+#endif
 
 #if ENABLE_DEDUP_PROFILE
     {
@@ -1119,7 +1161,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     }
 #endif
 
+#if ENABLE_PROFILE
     double t2 = MPI_Wtime();
+#endif
 
     // Parallel Prefix Sum & Rank-Relative Offset calculation (Absolute Cursor)
     const uint64_t v_begin = (N * static_cast<uint64_t>(shm_rank)) / shm_size;
@@ -1320,8 +1364,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Barrier(MPI_COMM_WORLD);
 #endif
 
+#if ENABLE_PROFILE
     double t_prefix = MPI_Wtime() - t2;
     double t3 = MPI_Wtime();
+#endif
 
     // Pass 2: fill adj (lock-free) with Absolute Cursor
 #if PASS2_MODE == 0
@@ -1735,11 +1781,15 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 
 #endif
 
+#if ENABLE_PROFILE || PRINT_PASS2
     double t_pass2 = MPI_Wtime() - t3;
+#endif
 #if PRINT_PASS2
     if (world_rank == 0) std::printf("Pass 2 time: %.4f s\n", t_pass2);
 #endif
+#if ENABLE_PROFILE
     double t4 = MPI_Wtime();
+#endif
 
     // 4. SSSP Execution
     const std::vector<uint32_t> samples = sample_vertices(p);
@@ -1846,8 +1896,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
 
+#if ENABLE_PROFILE
     double t_sssp = MPI_Wtime() - t4;
     double t5 = MPI_Wtime();
+#endif
 
     // 5. Rank 0 copies shared results to output vector
     if (world_rank == 0) {

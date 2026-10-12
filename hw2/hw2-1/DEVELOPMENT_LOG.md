@@ -513,3 +513,33 @@ the reduced owner-local CSR scatter range.
 2. **完整 Total 不退步**
 3. **所有輸出 byte-for-byte MATCH**
 4. 若預取改善未達 5%，立即停止；後續才評估 Degree-Aware Frontier Edge-Range Partition。
+
+---
+
+## 12. Milestone Clean Release：移除 Release 路徑之 Profiling 開銷 (Phase 1)
+
+### 12.1 實作與靜態檢查
+- **修改內容**：在 `cooperative_dial` 與 `cooperative_delta_stepping` 最內層熱循環中，將所有只用於統計的 `MPI_Wtime()` 與 `SSSPStats` 累加操作以 `#if ENABLE_PROFILE` 包覆。
+- **每輪移除開銷**：
+  - 移除 10 次 `MPI_Wtime()` 呼叫。
+  - 移除 7 次 `stats` 累加更新。
+- **靜態檢驗 (`objdump -d`)**：
+  - Base 二進位檔含 21 處 `MPI_Wtime@plt` 呼叫。
+  - Clean Release 執行檔中 `MPI_Wtime@plt` 呼叫次數精確降為 **0**。
+
+### 12.2 正確性驗證 (8 案例 100% MATCH)
+- 測試案例：Case 01, 06, 09, 10, 12, 14, 16, 17。
+- 結果：Clean Release 與官方 Golden Binary 及 Base 輸出比對，全部 **100% Byte-for-Byte MATCH**。
+
+### 12.3 四案例完整 A/B 數據 (8 ranks, 5 輪交錯)
+- Case 06：Base 5.3936 s | Clean 5.3298 s | $\Delta = +0.0638\text{ s}$ (+1.18%)
+- Case 09：Base 12.5869 s | Clean 12.9560 s | $\Delta = -0.3691\text{ s}$ (-2.93%)
+- Case 10：Base 32.3670 s | Clean 32.4098 s | $\Delta = -0.0428\text{ s}$ (-0.13%)
+- Case 12：Base 6.4004 s | Clean 6.3725 s | $\Delta = +0.0279\text{ s}$ (+0.44%)
+- **四案例總和**：Base 56.7479 s vs Clean 57.0681 s（差異 +0.3202 s / -0.56%）。
+
+### 12.4 決策結論
+- Clean 與 Base 巨觀效能持平（差異完全落在正常節點波動範圍內）。
+- 接受作為新 Baseline，降低熱迴圈暫存器壓力並維持純淨的 Release 語意。
+- 建立 Git Tag `hw2-1-clean-release`。
+
