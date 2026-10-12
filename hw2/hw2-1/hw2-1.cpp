@@ -27,8 +27,17 @@
 #endif
 
 #ifndef CHUNK_MODE
-#define CHUNK_MODE 0 // 0: Adaptive, 1: 64, 2: 256, 3: 1024
+#define CHUNK_MODE 0 // 0: Legacy (16..2048), 1: Fixed 64, 2: Team-aware Adaptive (16/32/64)
 #endif
+
+#ifndef SOURCE_TEAM_MODE
+#define SOURCE_TEAM_MODE 3 // 0: max teams (up to S), 1: 2 teams, 2: 1 team, 3: hybrid
+#endif
+
+#ifndef PRINT_TEAM_SELECTION
+#define PRINT_TEAM_SELECTION 0
+#endif
+
 
 #ifndef ENABLE_PROFILE
 #define ENABLE_PROFILE 0 // 0: Release (no reductions/printfs), 1: Debug profiling
@@ -60,15 +69,56 @@
 
 namespace {
 
-static inline uint64_t choose_work_chunk(uint64_t frontier_size, int team_size) {
+static inline uint64_t choose_work_chunk(
+    uint64_t frontier_size,
+    int team_size)
+{
+#if CHUNK_MODE == 1
+
+    // Fixed 64
+    return 64;
+
+#elif CHUNK_MODE == 2
+
+    // Team-aware conservative adaptive strategy.
+    // Small teams need finer granularity because one high-degree hub
+    // can dominate a large vertex chunk.
+    if (team_size <= 3) {
+        if (frontier_size <= 32768)
+            return 16;
+
+        return 32;
+    }
+
+    // Larger teams use 16 / 32 / 64.
+    // Never exceed 64.
+    if (frontier_size <= 2048)
+        return 16;
+
+    if (frontier_size <= 32768)
+        return 32;
+
+    return 64;
+
+#else
+
+    // Legacy strategy used by the official 56.40-second baseline.
     if (frontier_size <= 4096)
         return 16;
-    uint64_t chunk = frontier_size / (uint64_t(team_size) * 128);
+
+    uint64_t chunk =
+        frontier_size /
+        (static_cast<uint64_t>(team_size) * 128);
+
     if (chunk < 32)
         chunk = 32;
+
     if (chunk > 2048)
         chunk = 2048;
+
     return chunk;
+
+#endif
 }
 
 const uint32_t INF = 0xffffffffu;
@@ -606,19 +656,7 @@ void cooperative_dial(
             double tr0 = MPI_Wtime();
 #endif
             // 3. Dynamic work chunk distribution across team ranks
-#if CHUNK_MODE == 1
-            const uint64_t work_chunk = 64;
-#elif CHUNK_MODE == 2
-            const uint64_t work_chunk = 256;
-#elif CHUNK_MODE == 3
-            const uint64_t work_chunk = 1024;
-#elif CHUNK_MODE == 4
-            const uint64_t work_chunk = 32;
-#elif CHUNK_MODE == 5
-            const uint64_t work_chunk = 16;
-#else
             const uint64_t work_chunk = choose_work_chunk(total_count, team_size);
-#endif
             while (true) {
                 uint64_t begin = __atomic_fetch_add(shared_work_index, work_chunk, __ATOMIC_RELAXED);
                 if (begin >= total_count) break;
@@ -746,15 +784,7 @@ void cooperative_delta_stepping(
 
             double tr0 = MPI_Wtime();
 #endif
-#if CHUNK_MODE == 1
-            const uint64_t work_chunk = 64;
-#elif CHUNK_MODE == 2
-            const uint64_t work_chunk = 256;
-#elif CHUNK_MODE == 3
-            const uint64_t work_chunk = 1024;
-#else
             const uint64_t work_chunk = choose_work_chunk(total_count, team_size);
-#endif
             while (true) {
                 uint64_t begin = __atomic_fetch_add(shared_work_index, work_chunk, __ATOMIC_RELAXED);
                 if (begin >= total_count) break;
@@ -837,7 +867,49 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 
     // Cooperative team configuration (when sufficient ranks exceed sources)
     bool use_coop = (world_size >= 4 && world_size > static_cast<int>(S) && p.scale >= 20);
-    int team_count = use_coop ? std::min<int>(world_size, static_cast<int>(S)) : 1;
+    int team_count = 1;
+    if (use_coop) {
+#if SOURCE_TEAM_MODE == 1
+        // Mode 1: two teams.
+        team_count = std::min<int>(world_size, 2);
+#elif SOURCE_TEAM_MODE == 2
+        // Mode 2: one team.
+        team_count = 1;
+#elif SOURCE_TEAM_MODE == 3
+        // Hybrid mode.
+        const int source_count = static_cast<int>(S);
+        if (source_count <= 4 && M <= (uint64_t(1) << 26)) {
+            // Small graph with few sources:
+            // keep maximum source-level parallelism.
+            team_count = std::min<int>(world_size, source_count);
+        } else {
+            // Medium/large graph or more sources:
+            // use two teams to balance source concurrency,
+            // memory bandwidth, team size, and collective cost.
+            team_count = std::min<int>(world_size, 2);
+        }
+#else
+        // Mode 0: maximum source-level concurrency.
+        team_count = std::min<int>(world_size, static_cast<int>(S));
+#endif
+    }
+
+#if PRINT_TEAM_SELECTION
+    if (world_rank == 0) {
+        std::printf(
+            "[Team Selection] "
+            "scale=%d edgefactor=%d "
+            "S=%zu M=%llu "
+            "use_coop=%d teams=%d\n",
+            p.scale,
+            p.edgefactor,
+            S,
+            static_cast<unsigned long long>(M),
+            use_coop ? 1 : 0,
+            team_count
+        );
+    }
+#endif
 
     // 2. Compute memory layout for Shared-Memory Window
     uint64_t row_bytes     = align64((N + 1) * sizeof(uint64_t));
@@ -1812,12 +1884,24 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         const uint64_t t_v_end   = (N * static_cast<uint64_t>(team_rank + 1)) / team_size;
 
         for (size_t s = team_id; s < S; s += team_count) {
+#if ENABLE_PROFILE
+            double t_src_0 = MPI_Wtime();
+#endif
 #if DELTA_STEPPING > 1
             cooperative_delta_stepping(row, adj, N, sources[s], t_dist, t_frontier,
                                        t_work_idx, team_comm, team_rank, team_size, win, sssp_stats, DELTA_STEPPING);
 #else
             cooperative_dial(row, adj, N, sources[s], t_dist, t_frontier,
                              t_work_idx, team_comm, team_rank, team_size, win, sssp_stats);
+#endif
+#if ENABLE_PROFILE
+            double t_src_elapsed = MPI_Wtime() - t_src_0;
+            double max_src_time = 0;
+            MPI_Reduce(&t_src_elapsed, &max_src_time, 1, MPI_DOUBLE, MPI_MAX, 0, team_comm);
+            if (team_rank == 0) {
+                std::printf("[Team %d Source %zu (v=%u)] SSSP Time: %.4fs\n",
+                            team_id, s, sources[s], max_src_time);
+            }
 #endif
 
             // Parallel compute summary statistics for this source
@@ -1856,6 +1940,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                     my_sample[k] = (t_dist[samples[k]] == INF) ? -1 : static_cast<int32_t>(t_dist[samples[k]]);
                 }
             }
+
+            MPI_Win_sync(win);
+            MPI_Barrier(team_comm);
+            MPI_Win_sync(win);
         }
 
         MPI_Comm_free(&team_comm);

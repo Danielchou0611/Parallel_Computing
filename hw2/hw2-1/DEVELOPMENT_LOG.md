@@ -543,3 +543,40 @@ the reduced owner-local CSR scatter range.
 - 接受作為新 Baseline，降低熱迴圈暫存器壓力並維持純淨的 Release 語意。
 - 建立 Git Tag `hw2-1-clean-release`。
 
+---
+
+## 13. Milestone Hybrid Source-Team Selector：55.05 秒官方突破 (Run 5)
+
+### 13.1 背景與問題根源
+- 先前在 24-rank 下測試純 Mode 1（固定 2 teams）時，雖然在多 sources 與大圖（Case 06, 11, 13）取得巨大加速，但在小圖少 source（Case 04, scale 22, $S=4, M \le 2^{26}$）因團隊過大跨 NUMA 溝通產生退步（1.08s $\to$ 1.19s）。
+- 正式提交版本因巨集設定與分支缺失，先前未正確將 Hybrid 邏輯接入 Judge 預設路徑。
+
+### 13.2 演算法實作 (`SOURCE_TEAM_MODE=3`)
+- 在 [hw2-1.cpp](file:///mnt/c/parallel_computing/hw2/hw2-1/hw2-1.cpp) 中正式實作動態 Hybrid 選擇器：
+  ```cpp
+  const int source_count = static_cast<int>(S);
+  if (source_count <= 4 && M <= (uint64_t(1) << 26)) {
+      // 小圖且少 sources：維持最大 source-level 平行度 (4 teams × 6 ranks)
+      team_count = std::min<int>(world_size, source_count);
+  } else {
+      // 中大圖或多 sources：限制為 2 teams (12 ranks/team) 平衡記憶體頻寬與排隊
+      team_count = std::min<int>(world_size, 2);
+  }
+  ```
+- 維持 Clean Release：`ENABLE_PROFILE=0`，`PRINT_TEAM_SELECTION=0`，`MPI_Wtime` 呼叫次數精確為 0。
+
+### 13.3 官方評測結果 (Run 5 on Seiren)
+- **總計算時間**：**55.05 秒**（由 56.40 秒大幅下降 **-1.35 秒**，達到明確成功標準 `< 56.40s`）。
+- **關鍵案例表現**：
+  - **Case 04 成功防禦**：1.01s（超越前版最佳 1.08s，徹底消除退步）。
+  - **Case 11 巨大突破**：1.99s（由 2.82s 暴減 0.83 秒，-29.4%）。
+  - **Case 07 首次破 4 秒**：3.99s（前版 4.27s）。
+  - **Case 08 大幅加速**：3.55s（前版 4.20s）。
+  - **Case 06 創歷史最佳**：2.74s（前版 3.00s）。
+  - **Case 09 創歷史最佳**：9.22s（前版 9.26s）。
+  - **Case 13 創歷史最佳**：3.48s（前版 3.63s）。
+- **正確性**：17/17 ALL ACCEPTED (AC)。
+
+### 13.4 決策結論
+- 正式將 **Version 6 (Hybrid Source-Team Selector Mode 3)** 定為唯一官方 Baseline（55.05s）。
+- 保留目前所有配置：`GEN_MODE=2`, `PASS2_MODE=0`, `CHUNK_MODE=0`, `SOURCE_TEAM_MODE=3`。
