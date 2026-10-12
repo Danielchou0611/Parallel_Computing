@@ -452,3 +452,64 @@ the reduced owner-local CSR scatter range.
 
 
 
+## 10. Milestone G5：8-Way AVX2 雙軌並行生成器評估與決策 (Negative Result / Rejected)
+
+### 10.1 實驗設計與動機
+- **設計**：將 G4 的 4-Way AVX2 擴展至 8-Way 雙軌交錯（Dual-Track Interleaved Execution），在單一函式內以兩個 `__m256i` 暫存器管線同時計算 8 條邊的 8-level Kronecker 下降，企圖以更高的指令級並行度（ILP）隱藏延遲。
+- **微架構實測**：純生成器（Pure Generator）吞吐量比 G4 快約 **17%**。
+- **完整 Pass 1 獨立微基準**：
+  - Case 07：+4.42%
+  - Case 09：+3.90%
+  - Case 10：+8.03%
+  - 三個案例皆未退步，且不增加 shared memory、private memory 或 MPI communication。
+
+### 10.2 Milestone G5.4 完整 8-Rank MPI 交錯 A/B 評測數據
+
+採交錯執行順序（1 組 Warm-up 不計入統計，每案例保留 5 組有效交錯樣本）：
+
+| 測試案例 | G4 Baseline (Median) | G5 Candidate (Median) | 差異 ($\Delta$) | 改善率 (%) | 正確性 (Golden Match) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Case 07** | 5.3424 s | 5.1820 s | +0.1604 s | **+3.00%** | Byte-for-byte MATCH |
+| **Case 09** | 12.0834 s | 12.1376 s | -0.0542 s | **-0.45%** | Byte-for-byte MATCH |
+| **Case 10** | 31.8913 s | 32.0409 s | -0.1496 s | **-0.47%** | Byte-for-byte MATCH |
+
+- **三案例 Median 總和**：
+  - G4 Baseline：**49.3171 s**
+  - G5 Candidate：**49.3605 s**
+  - Net Delta：**-0.0434 s (-0.09%)**
+
+### 10.3 結論與決策 (Rejected)
+- **G5 8-way AVX2 rejected.**
+- **歸因分析**：生成器微架構層級的 8% Pass 1 收益，在完整 MPI 程式中被隨機 degree 更新、記憶體寫入頻寬飽和、Pass 2 全域 CSR 重構以及 SSSP 隨機走訪成本完全稀釋抹平。
+- **正式 Baseline 維持**：
+  - `GEN_MODE = 2`
+  - `PASS2_MODE = 0`
+  - 診斷開關全數關閉（`ENABLE_PROFILE=0`, `ENABLE_DEBUG_INVARIANTS=0`, `ENABLE_BOUNDARY_PROFILE=0`, `ENABLE_DEDUP_PROFILE=0`）。
+- **代碼處置**：`hw2-1.cpp` 中保留 `GEN_MODE == 3` 條件編譯分支，但預設值維持 2；建立存檔副本 `hw2-1-g5-experiment.cpp` 並打上 Git Tag `g5-negative-result`。
+
+---
+
+## 11. 下一步實驗路徑：SSSP `dist[]` 存取延遲與軟體預取 (Software Prefetch)
+
+### 11.1 核心假設與單一變因原則
+下一個優化切入點由「圖生成（計算密集）」轉向「SSSP 松弛階段的隨機記憶體跳轉延遲（記憶體延遲受限）」。
+
+### 11.2 實驗設計 (DIST_PREFETCH)
+採單一變因軟體預取 A/B 測試：
+- 測試參數：`DIST_PREFETCH` = `0`, `8`, `16`, `32`, `64`
+- **只預取**：
+  ```cpp
+  dist[adj[future].to]
+  ```
+- **禁止事項（嚴格保持單一變因）**：
+  - 不要預取連續的 `adj[]`
+  - 不要額外在 `atomic_min` 前讀一次 `dist[y]`
+  - 不要同時修改 chunk size
+  - 不要同時修改 team selector
+  - 不要同時加入 Degree-Aware Frontier
+
+### 11.3 接受標準 (Acceptance Criteria)
+1. **Case 09、Case 10 的 SSSP median 至少改善 5%**
+2. **完整 Total 不退步**
+3. **所有輸出 byte-for-byte MATCH**
+4. 若預取改善未達 5%，立即停止；後續才評估 Degree-Aware Frontier Edge-Range Partition。

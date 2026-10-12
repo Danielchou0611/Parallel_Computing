@@ -55,7 +55,7 @@
 #endif
 
 #ifndef GEN_MODE
-#define GEN_MODE 2 // 0: baseline 1-way scalar, 1: 4-way scalar batch (G3), 2: 4-way AVX2 block descent (G4)
+#define GEN_MODE 2 // 0: baseline 1-way scalar, 1: 4-way scalar batch (G3), 2: 4-way AVX2 block descent (G4), 3: 8-way AVX2 dual-track (G5)
 #endif
 
 namespace {
@@ -319,6 +319,137 @@ struct FastGenerator {
         w[1] = static_cast<uint8_t>(1 + (h1 % 255));
         w[2] = static_cast<uint8_t>(1 + (h2 % 255));
         w[3] = static_cast<uint8_t>(1 + (h3 % 255));
+    }
+
+    // G5: 8-way AVX2 (Dual-Track Interleaved Execution)
+    inline void generate8_avx2(uint64_t i, uint32_t *u, uint32_t *v, uint8_t *w) const {
+        uint64_t s0 = mix_hash(mixed_seed ^ ((i + 0) * 0xd6e8feb86659fd93ULL));
+        uint64_t s4 = mix_hash(mixed_seed ^ ((i + 4) * 0xd6e8feb86659fd93ULL));
+        uint64_t s1 = mix_hash(mixed_seed ^ ((i + 1) * 0xd6e8feb86659fd93ULL));
+        uint64_t s5 = mix_hash(mixed_seed ^ ((i + 5) * 0xd6e8feb86659fd93ULL));
+        uint64_t s2 = mix_hash(mixed_seed ^ ((i + 2) * 0xd6e8feb86659fd93ULL));
+        uint64_t s6 = mix_hash(mixed_seed ^ ((i + 6) * 0xd6e8feb86659fd93ULL));
+        uint64_t s3 = mix_hash(mixed_seed ^ ((i + 3) * 0xd6e8feb86659fd93ULL));
+        uint64_t s7 = mix_hash(mixed_seed ^ ((i + 7) * 0xd6e8feb86659fd93ULL));
+
+        uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+        uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, b7 = 0;
+
+        const __m256i sign_flip = _mm256_set1_epi8((char)0x80);
+        const __m256i thr_a     = _mm256_set1_epi8((char)(195 ^ 0x80) - 1);
+        const __m256i thr_b_lo  = _mm256_set1_epi8((char)(146 ^ 0x80) - 1);
+        const __m256i thr_b_hi  = _mm256_set1_epi8((char)(195 ^ 0x80));
+        const __m256i thr_b_top = _mm256_set1_epi8((char)(243 ^ 0x80) - 1);
+
+        int rem_levels = scale;
+        int shift = 0;
+
+        while (rem_levels > 0) {
+            if (shift > 0) {
+                s0 = mix_hash(s0); s4 = mix_hash(s4);
+                s1 = mix_hash(s1); s5 = mix_hash(s5);
+                s2 = mix_hash(s2); s6 = mix_hash(s6);
+                s3 = mix_hash(s3); s7 = mix_hash(s7);
+            }
+            __m256i vec_a = _mm256_set_epi64x(s3, s2, s1, s0);
+            __m256i vec_b = _mm256_set_epi64x(s7, s6, s5, s4);
+
+            __m256i vec_s_a = _mm256_xor_si256(vec_a, sign_flip);
+            __m256i vec_s_b = _mm256_xor_si256(vec_b, sign_flip);
+
+            // bit_a
+            __m256i cmp_a_a = _mm256_cmpgt_epi8(vec_s_a, thr_a);
+            __m256i cmp_a_b = _mm256_cmpgt_epi8(vec_s_b, thr_a);
+            uint32_t mask_a_a = (uint32_t)_mm256_movemask_epi8(cmp_a_a);
+            uint32_t mask_a_b = (uint32_t)_mm256_movemask_epi8(cmp_a_b);
+
+            // bit_b
+            __m256i ge_lo_a = _mm256_cmpgt_epi8(vec_s_a, thr_b_lo);
+            __m256i ge_lo_b = _mm256_cmpgt_epi8(vec_s_b, thr_b_lo);
+            __m256i lt_hi_a = _mm256_cmpgt_epi8(thr_b_hi, vec_s_a);
+            __m256i lt_hi_b = _mm256_cmpgt_epi8(thr_b_hi, vec_s_b);
+            __m256i mid_a   = _mm256_and_si256(ge_lo_a, lt_hi_a);
+            __m256i mid_b   = _mm256_and_si256(ge_lo_b, lt_hi_b);
+            __m256i top_a   = _mm256_cmpgt_epi8(vec_s_a, thr_b_top);
+            __m256i top_b   = _mm256_cmpgt_epi8(vec_s_b, thr_b_top);
+            __m256i cmp_b_a = _mm256_or_si256(mid_a, top_a);
+            __m256i cmp_b_b = _mm256_or_si256(mid_b, top_b);
+            uint32_t mask_b_a = (uint32_t)_mm256_movemask_epi8(cmp_b_a);
+            uint32_t mask_b_b = (uint32_t)_mm256_movemask_epi8(cmp_b_b);
+
+            int chunk = std::min(rem_levels, 8);
+            uint32_t chunk_mask = (1u << chunk) - 1u;
+
+            a0 |= ((mask_a_a >> 0)  & chunk_mask) << shift;
+            a1 |= ((mask_a_a >> 8)  & chunk_mask) << shift;
+            a2 |= ((mask_a_a >> 16) & chunk_mask) << shift;
+            a3 |= ((mask_a_a >> 24) & chunk_mask) << shift;
+
+            a4 |= ((mask_a_b >> 0)  & chunk_mask) << shift;
+            a5 |= ((mask_a_b >> 8)  & chunk_mask) << shift;
+            a6 |= ((mask_a_b >> 16) & chunk_mask) << shift;
+            a7 |= ((mask_a_b >> 24) & chunk_mask) << shift;
+
+            b0 |= ((mask_b_a >> 0)  & chunk_mask) << shift;
+            b1 |= ((mask_b_a >> 8)  & chunk_mask) << shift;
+            b2 |= ((mask_b_a >> 16) & chunk_mask) << shift;
+            b3 |= ((mask_b_a >> 24) & chunk_mask) << shift;
+
+            b4 |= ((mask_b_b >> 0)  & chunk_mask) << shift;
+            b5 |= ((mask_b_b >> 8)  & chunk_mask) << shift;
+            b6 |= ((mask_b_b >> 16) & chunk_mask) << shift;
+            b7 |= ((mask_b_b >> 24) & chunk_mask) << shift;
+
+            shift += 8;
+            rem_levels -= 8;
+        }
+
+        if (scramble) {
+            a0 = scramble_id(a0); b0 = scramble_id(b0);
+            a4 = scramble_id(a4); b4 = scramble_id(b4);
+            a1 = scramble_id(a1); b1 = scramble_id(b1);
+            a5 = scramble_id(a5); b5 = scramble_id(b5);
+            a2 = scramble_id(a2); b2 = scramble_id(b2);
+            a6 = scramble_id(a6); b6 = scramble_id(b6);
+            a3 = scramble_id(a3); b3 = scramble_id(b3);
+            a7 = scramble_id(a7); b7 = scramble_id(b7);
+        }
+
+        u[0] = a0; v[0] = b0;
+        u[1] = a1; v[1] = b1;
+        u[2] = a2; v[2] = b2;
+        u[3] = a3; v[3] = b3;
+        u[4] = a4; v[4] = b4;
+        u[5] = a5; v[5] = b5;
+        u[6] = a6; v[6] = b6;
+        u[7] = a7; v[7] = b7;
+
+        uint64_t lo0 = std::min(a0, b0), hi0 = std::max(a0, b0);
+        uint64_t lo4 = std::min(a4, b4), hi4 = std::max(a4, b4);
+        uint64_t lo1 = std::min(a1, b1), hi1 = std::max(a1, b1);
+        uint64_t lo5 = std::min(a5, b5), hi5 = std::max(a5, b5);
+        uint64_t lo2 = std::min(a2, b2), hi2 = std::max(a2, b2);
+        uint64_t lo6 = std::min(a6, b6), hi6 = std::max(a6, b6);
+        uint64_t lo3 = std::min(a3, b3), hi3 = std::max(a3, b3);
+        uint64_t lo7 = std::min(a7, b7), hi7 = std::max(a7, b7);
+
+        uint64_t h0 = mix_hash(mixed_seed_w ^ (((hi0 << 32) | lo0) * 0xd6e8feb86659fd93ULL));
+        uint64_t h4 = mix_hash(mixed_seed_w ^ (((hi4 << 32) | lo4) * 0xd6e8feb86659fd93ULL));
+        uint64_t h1 = mix_hash(mixed_seed_w ^ (((hi1 << 32) | lo1) * 0xd6e8feb86659fd93ULL));
+        uint64_t h5 = mix_hash(mixed_seed_w ^ (((hi5 << 32) | lo5) * 0xd6e8feb86659fd93ULL));
+        uint64_t h2 = mix_hash(mixed_seed_w ^ (((hi2 << 32) | lo2) * 0xd6e8feb86659fd93ULL));
+        uint64_t h6 = mix_hash(mixed_seed_w ^ (((hi6 << 32) | lo6) * 0xd6e8feb86659fd93ULL));
+        uint64_t h3 = mix_hash(mixed_seed_w ^ (((hi3 << 32) | lo3) * 0xd6e8feb86659fd93ULL));
+        uint64_t h7 = mix_hash(mixed_seed_w ^ (((hi7 << 32) | lo7) * 0xd6e8feb86659fd93ULL));
+
+        w[0] = static_cast<uint8_t>(1 + (h0 % 255));
+        w[1] = static_cast<uint8_t>(1 + (h1 % 255));
+        w[2] = static_cast<uint8_t>(1 + (h2 % 255));
+        w[3] = static_cast<uint8_t>(1 + (h3 % 255));
+        w[4] = static_cast<uint8_t>(1 + (h4 % 255));
+        w[5] = static_cast<uint8_t>(1 + (h5 % 255));
+        w[6] = static_cast<uint8_t>(1 + (h6 % 255));
+        w[7] = static_cast<uint8_t>(1 + (h7 % 255));
     }
 };
 
@@ -761,6 +892,17 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         }
 #elif GEN_MODE == 2
         uint64_t k = 0;
+        for (; k + 4 <= chunk_len; k += 4) {
+            gctx.generate4_avx2(i + k, &u[k], &v[k], &w_chunk[k]);
+        }
+        for (; k < chunk_len; ++k) {
+            gctx.generate(i + k, u[k], v[k], w_chunk[k]);
+        }
+#elif GEN_MODE == 3
+        uint64_t k = 0;
+        for (; k + 8 <= chunk_len; k += 8) {
+            gctx.generate8_avx2(i + k, &u[k], &v[k], &w_chunk[k]);
+        }
         for (; k + 4 <= chunk_len; k += 4) {
             gctx.generate4_avx2(i + k, &u[k], &v[k], &w_chunk[k]);
         }
