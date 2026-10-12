@@ -10,6 +10,7 @@
 #include <iostream>
 #include <utility>
 #include <vector>
+#include <immintrin.h>
 
 #include "graph_gen.hpp"
 
@@ -51,6 +52,10 @@
 
 #ifndef PRINT_PASS2
 #define PRINT_PASS2 0
+#endif
+
+#ifndef GEN_MODE
+#define GEN_MODE 2 // 0: baseline 1-way scalar, 1: 4-way scalar batch (G3), 2: 4-way AVX2 block descent (G4)
 #endif
 
 namespace {
@@ -162,6 +167,158 @@ struct FastGenerator {
         uint64_t pair_key = (hi << 32) | lo;
         uint64_t h = mix_hash(mixed_seed_w ^ (pair_key * 0xd6e8feb86659fd93ULL));
         w = static_cast<uint8_t>(1 + (h % 255));
+    }
+
+    inline void generate4_scalar(uint64_t i, uint32_t *u, uint32_t *v, uint8_t *w) const {
+        uint64_t s0 = mix_hash(mixed_seed ^ ((i + 0) * 0xd6e8feb86659fd93ULL));
+        uint64_t s1 = mix_hash(mixed_seed ^ ((i + 1) * 0xd6e8feb86659fd93ULL));
+        uint64_t s2 = mix_hash(mixed_seed ^ ((i + 2) * 0xd6e8feb86659fd93ULL));
+        uint64_t s3 = mix_hash(mixed_seed ^ ((i + 3) * 0xd6e8feb86659fd93ULL));
+
+        uint64_t bits0 = s0, bits1 = s1, bits2 = s2, bits3 = s3;
+        uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
+        for (int level = 0; level < scale; level++) {
+            if (level && (level & 7) == 0) {
+                s0 = mix_hash(s0); bits0 = s0;
+                s1 = mix_hash(s1); bits1 = s1;
+                s2 = mix_hash(s2); bits2 = s2;
+                s3 = mix_hash(s3); bits3 = s3;
+            }
+            unsigned r0 = (unsigned)(bits0 & 0xff); bits0 >>= 8;
+            unsigned r1 = (unsigned)(bits1 & 0xff); bits1 >>= 8;
+            unsigned r2 = (unsigned)(bits2 & 0xff); bits2 >>= 8;
+            unsigned r3 = (unsigned)(bits3 & 0xff); bits3 >>= 8;
+
+            uint32_t bit_a0 = (r0 >= 195);
+            uint32_t bit_b0 = ((r0 >= 146 && r0 < 195) || r0 >= 243);
+            a0 |= bit_a0 << level;
+            b0 |= bit_b0 << level;
+
+            uint32_t bit_a1 = (r1 >= 195);
+            uint32_t bit_b1 = ((r1 >= 146 && r1 < 195) || r1 >= 243);
+            a1 |= bit_a1 << level;
+            b1 |= bit_b1 << level;
+
+            uint32_t bit_a2 = (r2 >= 195);
+            uint32_t bit_b2 = ((r2 >= 146 && r2 < 195) || r2 >= 243);
+            a2 |= bit_a2 << level;
+            b2 |= bit_b2 << level;
+
+            uint32_t bit_a3 = (r3 >= 195);
+            uint32_t bit_b3 = ((r3 >= 146 && r3 < 195) || r3 >= 243);
+            a3 |= bit_a3 << level;
+            b3 |= bit_b3 << level;
+        }
+
+        if (scramble) {
+            a0 = scramble_id(a0); b0 = scramble_id(b0);
+            a1 = scramble_id(a1); b1 = scramble_id(b1);
+            a2 = scramble_id(a2); b2 = scramble_id(b2);
+            a3 = scramble_id(a3); b3 = scramble_id(b3);
+        }
+        u[0] = a0; v[0] = b0;
+        u[1] = a1; v[1] = b1;
+        u[2] = a2; v[2] = b2;
+        u[3] = a3; v[3] = b3;
+
+        uint64_t lo0 = std::min(a0, b0), hi0 = std::max(a0, b0);
+        uint64_t lo1 = std::min(a1, b1), hi1 = std::max(a1, b1);
+        uint64_t lo2 = std::min(a2, b2), hi2 = std::max(a2, b2);
+        uint64_t lo3 = std::min(a3, b3), hi3 = std::max(a3, b3);
+
+        uint64_t h0 = mix_hash(mixed_seed_w ^ (((hi0 << 32) | lo0) * 0xd6e8feb86659fd93ULL));
+        uint64_t h1 = mix_hash(mixed_seed_w ^ (((hi1 << 32) | lo1) * 0xd6e8feb86659fd93ULL));
+        uint64_t h2 = mix_hash(mixed_seed_w ^ (((hi2 << 32) | lo2) * 0xd6e8feb86659fd93ULL));
+        uint64_t h3 = mix_hash(mixed_seed_w ^ (((hi3 << 32) | lo3) * 0xd6e8feb86659fd93ULL));
+
+        w[0] = static_cast<uint8_t>(1 + (h0 % 255));
+        w[1] = static_cast<uint8_t>(1 + (h1 % 255));
+        w[2] = static_cast<uint8_t>(1 + (h2 % 255));
+        w[3] = static_cast<uint8_t>(1 + (h3 % 255));
+    }
+
+    inline void generate4_avx2(uint64_t i, uint32_t *u, uint32_t *v, uint8_t *w) const {
+        uint64_t s0 = mix_hash(mixed_seed ^ ((i + 0) * 0xd6e8feb86659fd93ULL));
+        uint64_t s1 = mix_hash(mixed_seed ^ ((i + 1) * 0xd6e8feb86659fd93ULL));
+        uint64_t s2 = mix_hash(mixed_seed ^ ((i + 2) * 0xd6e8feb86659fd93ULL));
+        uint64_t s3 = mix_hash(mixed_seed ^ ((i + 3) * 0xd6e8feb86659fd93ULL));
+
+        uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
+        const __m256i sign_flip = _mm256_set1_epi8((char)0x80);
+        const __m256i thr_a     = _mm256_set1_epi8((char)(195 ^ 0x80) - 1);  // 66
+        const __m256i thr_b_lo  = _mm256_set1_epi8((char)(146 ^ 0x80) - 1);  // 17
+        const __m256i thr_b_hi  = _mm256_set1_epi8((char)(195 ^ 0x80));      // 67
+        const __m256i thr_b_top = _mm256_set1_epi8((char)(243 ^ 0x80) - 1);  // 114
+
+        int rem_levels = scale;
+        int shift = 0;
+
+        while (rem_levels > 0) {
+            if (shift > 0) {
+                s0 = mix_hash(s0);
+                s1 = mix_hash(s1);
+                s2 = mix_hash(s2);
+                s3 = mix_hash(s3);
+            }
+            __m256i vec = _mm256_set_epi64x(s3, s2, s1, s0);
+            __m256i vec_s = _mm256_xor_si256(vec, sign_flip);
+
+            __m256i cmp_a = _mm256_cmpgt_epi8(vec_s, thr_a);
+            uint32_t mask_a = (uint32_t)_mm256_movemask_epi8(cmp_a);
+
+            __m256i ge_lo = _mm256_cmpgt_epi8(vec_s, thr_b_lo);
+            __m256i lt_hi = _mm256_cmpgt_epi8(thr_b_hi, vec_s);
+            __m256i mid   = _mm256_and_si256(ge_lo, lt_hi);
+            __m256i top   = _mm256_cmpgt_epi8(vec_s, thr_b_top);
+            __m256i cmp_b = _mm256_or_si256(mid, top);
+            uint32_t mask_b = (uint32_t)_mm256_movemask_epi8(cmp_b);
+
+            int chunk = std::min(rem_levels, 8);
+            uint32_t chunk_mask = (1u << chunk) - 1u;
+
+            a0 |= ((mask_a >> 0)  & chunk_mask) << shift;
+            a1 |= ((mask_a >> 8)  & chunk_mask) << shift;
+            a2 |= ((mask_a >> 16) & chunk_mask) << shift;
+            a3 |= ((mask_a >> 24) & chunk_mask) << shift;
+
+            b0 |= ((mask_b >> 0)  & chunk_mask) << shift;
+            b1 |= ((mask_b >> 8)  & chunk_mask) << shift;
+            b2 |= ((mask_b >> 16) & chunk_mask) << shift;
+            b3 |= ((mask_b >> 24) & chunk_mask) << shift;
+
+            shift += 8;
+            rem_levels -= 8;
+        }
+
+        if (scramble) {
+            a0 = scramble_id(a0); b0 = scramble_id(b0);
+            a1 = scramble_id(a1); b1 = scramble_id(b1);
+            a2 = scramble_id(a2); b2 = scramble_id(b2);
+            a3 = scramble_id(a3); b3 = scramble_id(b3);
+        }
+        u[0] = a0; v[0] = b0;
+        u[1] = a1; v[1] = b1;
+        u[2] = a2; v[2] = b2;
+        u[3] = a3; v[3] = b3;
+
+        uint64_t lo0 = std::min(a0, b0), hi0 = std::max(a0, b0);
+        uint64_t lo1 = std::min(a1, b1), hi1 = std::max(a1, b1);
+        uint64_t lo2 = std::min(a2, b2), hi2 = std::max(a2, b2);
+        uint64_t lo3 = std::min(a3, b3), hi3 = std::max(a3, b3);
+
+        uint64_t h0 = mix_hash(mixed_seed_w ^ (((hi0 << 32) | lo0) * 0xd6e8feb86659fd93ULL));
+        uint64_t h1 = mix_hash(mixed_seed_w ^ (((hi1 << 32) | lo1) * 0xd6e8feb86659fd93ULL));
+        uint64_t h2 = mix_hash(mixed_seed_w ^ (((hi2 << 32) | lo2) * 0xd6e8feb86659fd93ULL));
+        uint64_t h3 = mix_hash(mixed_seed_w ^ (((hi3 << 32) | lo3) * 0xd6e8feb86659fd93ULL));
+
+        w[0] = static_cast<uint8_t>(1 + (h0 % 255));
+        w[1] = static_cast<uint8_t>(1 + (h1 % 255));
+        w[2] = static_cast<uint8_t>(1 + (h2 % 255));
+        w[3] = static_cast<uint8_t>(1 + (h3 % 255));
     }
 };
 
@@ -594,9 +751,27 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     // Pass 1: count degrees (and optionally cache packed edges)
     for (uint64_t i = edge_begin; i < edge_end; i += CHUNK) {
         uint64_t chunk_len = std::min(CHUNK, edge_end - i);
+#if GEN_MODE == 1
+        uint64_t k = 0;
+        for (; k + 4 <= chunk_len; k += 4) {
+            gctx.generate4_scalar(i + k, &u[k], &v[k], &w_chunk[k]);
+        }
+        for (; k < chunk_len; ++k) {
+            gctx.generate(i + k, u[k], v[k], w_chunk[k]);
+        }
+#elif GEN_MODE == 2
+        uint64_t k = 0;
+        for (; k + 4 <= chunk_len; k += 4) {
+            gctx.generate4_avx2(i + k, &u[k], &v[k], &w_chunk[k]);
+        }
+        for (; k < chunk_len; ++k) {
+            gctx.generate(i + k, u[k], v[k], w_chunk[k]);
+        }
+#else
         for (uint64_t k = 0; k < chunk_len; k++) {
             gctx.generate(i + k, u[k], v[k], w_chunk[k]);
         }
+#endif
         uint64_t base_idx = i - edge_begin;
         for (uint64_t k = 0; k < chunk_len; k++) {
             uint32_t uk = u[k], vk = v[k];

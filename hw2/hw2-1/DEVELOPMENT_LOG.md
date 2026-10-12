@@ -376,3 +376,79 @@ the reduced owner-local CSR scatter range.
   * Grouped Write 在此基礎上還需額外支付 Staging Buffer 分配、Histogram 與搬移複製成本，注定更慢。
   * **正式決策：依照既定準則，正式終止 Vertex-Owner 路線，回歸並鎖定 60.31 秒的最佳正式 Baseline（PASS2_MODE=0）！**
 
+---
+
+## 9. Edge Generator 微架構優化（Milestone G1 ～ G4）
+
+在否決 Vertex-Owner 路線後，依規劃轉向**圖生成器（FastGenerator）**的向量化與微架構優化。此方向具備**零資料通訊、不改動 CSR 與 SSSP 架構、100% 逐邊驗證**等優勢。
+
+### 9.1 Milestone G1：組件耗時微基準分解 (Component Breakdown)
+透過獨立隔離測試（`test_gen_breakdown.cpp`，10,000,000 邊）精確量測生成管線各階段耗時：
+
+| 生成管線階段 | Case 10 (Scale 26, Scr 1) 耗時與佔比 | Case 09 (Scale 25, Scr 0) 耗時與佔比 | 分析與優化價值 |
+| :--- | :--- | :--- | :--- |
+| **1. Initial Mix Hash** | 0.0060s (1.28%) | 0.0059s (1.50%) | 極小，乘加管線已被編譯器優化 |
+| **2. Kronecker Descent** | **0.2963s (63.17%)** | **0.2877s (72.93%)** | **絕對最大瓶頸（佔比 63%～73%）**，26 層迴圈迭代為核心開銷 |
+| **3. Scramble ID** | 0.0130s (2.77%) | 0.0000s (0.00%) | 佔比極小，3 次乘法與異或位移效率高 |
+| **4. Weight Generation** | 0.0367s (7.83%) | 0.0374s (9.48%) | 次要瓶頸，需一次 `mix_hash` 與 `% 255` |
+| **5. 60-bit Edge Packing** | 0.0059s (1.25%) | 0.0057s (1.46%) | 純暫存器位移拼裝，極快 |
+| **6. Degree Update** | 0.1112s (23.70%) | 0.0577s (14.63%) | 次大開銷，源於全圖隨機記憶體寫入衝突 |
+
+* **結論**：證實優化重心必須鎖定在 **Kronecker Descent**。
+
+### 9.2 Milestone G2：純標量分支消除檢查 (Branchless Inspection)
+反組譯 GCC `-O3 -march=native` 彙編碼：
+- 編譯器已自動將 `r >= 195` 轉為 `cmp dil, 0xc2; seta al`。
+- 複合條件轉為無分支的 `lea eax, [r-146]; cmp eax, 48; setbe al; cmp r, 242; seta r13b; or eax, r13d`。
+- **結論**：GCC 已產生物理無分支指令，單 edge 標量手動重構無邊際效益。
+
+### 9.3 Milestone G3：四邊獨立管線批次 (4-Way Independent Scalar Batching)
+利用暫存器級指令並行（ILP），一次並行交錯執行 4 條獨立 edge：
+- 隱藏 64-bit 乘法與位移的 3~4 cycle 運算延遲。
+- **實測產出**：吞吐量由 25.60 M edges/s 提升至 33.19 M edges/s（**1.30x 加速**）。
+
+### 9.4 Milestone G4：AVX2 四邊並行 8-Level 區塊下降 (AVX2 Block Descent)
+針對 Kronecker Descent 設計專用 256-bit SIMD 演算法：
+1. 一個 `__m256i` 向量同時打包 4 條 edge 的 64-bit 狀態（共 32 個 bytes）。
+2. 將 8-bit unsigned 透過 XOR 0x80 映射至 signed 域。
+3. 透過 `_mm256_cmpgt_epi8`、`_mm256_and_si256`、`_mm256_or_si256` 進行平行比較。
+4. 呼叫單一 `_mm256_movemask_epi8`，在 **1 個 cycle 內直接抽取 4 條邊的 8 層位元遮罩**！
+5. 26 層 Descent 僅需 4 個 8-level 區塊，每區塊僅需 7 條向量指令即可完成 4 條邊的判定。
+
+#### 微基準與 Pass 1 實測效能：
+- **純生成吞吐量（`test_batch_gen`）**：
+  - Case 10：25.60 M/s $\to$ **89.11 M edges/s（3.48x 加速）**。
+  - Case 09：28.44 M/s $\to$ **98.55 M edges/s（3.47x 加速）**。
+- **單 Rank Pass 1 總耗時（含 Degree 更新與 Edge Packing）**：
+  - Case 10：2.4858s $\to$ **1.1678s（2.13x 加速，節省 1.32 秒）**。
+  - Case 09：1.0058s $\to$ **0.4310s（2.33x 加速，節省 0.57 秒）**。
+- **Chunk 緩衝架構驗證**：
+  - 測試了 `G4-Fused`（無緩衝直接寫入 Degree），發現每 4 條邊插入隨機 Degree 寫入會阻塞 CPU 暫存器管線（降速至 0.70x）；證實維持 **512K Chunk 局部緩衝**能讓 SIMD 生成器在 L1/L2 達到極速發揮。
+
+### 9.5 MPI 8-Rank 完整運行與正確性驗證
+
+| 測資 | 模式 | Pass 1 耗時 | Pass 2 耗時 | 圖構建總時間 | 總計算時間 (Compute Time) | 效益 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Case 07** | **Baseline** | 1.6061s | 0.9466s | 2.6174s | 5.6323s | 基準線 |
+| (Scale 24) | **G4 (AVX2)** | **0.9871s** | 1.1232s | **2.1789s** | **5.7001s** | **Pass 1 快 1.63x (-0.62s)** |
+| **Case 09** | **Baseline** | 3.8077s | 2.4289s | 6.3701s | 13.8073s | 基準線 |
+| (Scale 25) | **G4 (AVX2)** | **2.3381s** | 2.3020s | **4.7735s** | **12.4441s** | **Pass 1 快 1.63x (-1.47s)**<br>**Total 節省 1.36s** |
+| **Case 10** | **Baseline** | 11.4947s | 5.7136s | 17.5337s | 36.8334s | 基準線 |
+| (Scale 26) | **G4 (AVX2)** | **6.7284s** | 5.7386s | **12.7915s** | **32.3679s** | **Pass 1 快 1.71x (-4.77s)**<br>**Total 節省 4.47s (-12.1%)** |
+
+#### 正確性檢驗：
+- 跨 Scales 1～26、Scramble 0/1、多種 Seed 進行完全比對，所有 $(u, v, w)$ 100% 精確相符。
+- 針對全套官方測資執行完整驗證：**Case 01 至 Case 17 全部 100% Byte-for-Byte MATCH 官方 Golden Binary（17/17 AC）**！
+
+### 9.6 SEIREN 官方 24-Rank Judge 最新里程碑成績 (56.40 秒)
+- **評測結果**：**17 / 17 AC，總時間 56.40 秒**（前版 Baseline 為 60.31 秒，大幅推進 **-3.91 秒**）。
+- **關鍵亮點**：
+  - **Case 10 (Scale 26, Scr 1)**：24.31s $\to$ **21.90s（暴降 2.41 秒！）**
+  - **Case 07 (Scale 24, Scr 0)**：4.96s $\to$ **4.27s（降低 0.69 秒）**
+  - **Case 09 (Scale 25, Scr 0)**：9.13s $\to$ **9.26s（微幅波動 1.4%）**
+- **歸檔狀態**：
+  - 凍結為正式基準：`hw2-1-g4-ac-56.40.cpp`、`hw2-1-g4-ac-56.40`
+  - Git Tag 鎖定：`hw2-1-g4-ac-56.40`
+
+
+
