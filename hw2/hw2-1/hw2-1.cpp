@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -24,7 +25,46 @@
 #define DELTA_STEPPING 1 // 1: Dial, >1: Delta-Stepping with bucket width DELTA_STEPPING
 #endif
 
+#ifndef CHUNK_MODE
+#define CHUNK_MODE 0 // 0: Adaptive, 1: 64, 2: 256, 3: 1024
+#endif
+
+#ifndef ENABLE_PROFILE
+#define ENABLE_PROFILE 0 // 0: Release (no reductions/printfs), 1: Debug profiling
+#endif
+
+#ifndef ENABLE_DEDUP_PROFILE
+#define ENABLE_DEDUP_PROFILE 0 // 0: Release (zero overhead), 1: Full duplicate profiler
+#endif
+
+#ifndef ENABLE_BOUNDARY_PROFILE
+#define ENABLE_BOUNDARY_PROFILE 0 // 0: Release (zero overhead), 1: Boundary & owner profiler
+#endif
+
+#ifndef PASS2_MODE
+#define PASS2_MODE 0 // 0: 8-bit radix baseline, 1: Vertex-Owner direct scatter
+#endif
+
+#ifndef ENABLE_DEBUG_INVARIANTS
+#define ENABLE_DEBUG_INVARIANTS 0 // 0: Release, 1: Verify cursor and mailbox invariants
+#endif
+
+#ifndef PRINT_PASS2
+#define PRINT_PASS2 0
+#endif
+
 namespace {
+
+static inline uint64_t choose_work_chunk(uint64_t frontier_size, int team_size) {
+    if (frontier_size <= 4096)
+        return 16;
+    uint64_t chunk = frontier_size / (uint64_t(team_size) * 128);
+    if (chunk < 32)
+        chunk = 32;
+    if (chunk > 2048)
+        chunk = 2048;
+    return chunk;
+}
 
 const uint32_t INF = 0xffffffffu;
 
@@ -268,11 +308,23 @@ void cooperative_dial(
 
             double tr0 = MPI_Wtime();
             // 3. Dynamic work chunk distribution across team ranks
-            constexpr uint64_t WORK_CHUNK = 64;
+#if CHUNK_MODE == 1
+            const uint64_t work_chunk = 64;
+#elif CHUNK_MODE == 2
+            const uint64_t work_chunk = 256;
+#elif CHUNK_MODE == 3
+            const uint64_t work_chunk = 1024;
+#elif CHUNK_MODE == 4
+            const uint64_t work_chunk = 32;
+#elif CHUNK_MODE == 5
+            const uint64_t work_chunk = 16;
+#else
+            const uint64_t work_chunk = choose_work_chunk(total_count, team_size);
+#endif
             while (true) {
-                uint64_t begin = __atomic_fetch_add(shared_work_index, WORK_CHUNK, __ATOMIC_RELAXED);
+                uint64_t begin = __atomic_fetch_add(shared_work_index, work_chunk, __ATOMIC_RELAXED);
                 if (begin >= total_count) break;
-                uint64_t end = std::min(begin + WORK_CHUNK, total_count);
+                uint64_t end = std::min(begin + work_chunk, total_count);
 
                 for (uint64_t i = begin; i < end; ++i) {
                     uint32_t x = shared_frontier[i];
@@ -378,11 +430,19 @@ void cooperative_delta_stepping(
             stats.collective_time += (MPI_Wtime() - tc1);
 
             double tr0 = MPI_Wtime();
-            constexpr uint64_t WORK_CHUNK = 64;
+#if CHUNK_MODE == 1
+            const uint64_t work_chunk = 64;
+#elif CHUNK_MODE == 2
+            const uint64_t work_chunk = 256;
+#elif CHUNK_MODE == 3
+            const uint64_t work_chunk = 1024;
+#else
+            const uint64_t work_chunk = choose_work_chunk(total_count, team_size);
+#endif
             while (true) {
-                uint64_t begin = __atomic_fetch_add(shared_work_index, WORK_CHUNK, __ATOMIC_RELAXED);
+                uint64_t begin = __atomic_fetch_add(shared_work_index, work_chunk, __ATOMIC_RELAXED);
                 if (begin >= total_count) break;
-                uint64_t end = std::min(begin + WORK_CHUNK, total_count);
+                uint64_t end = std::min(begin + work_chunk, total_count);
 
                 for (uint64_t i = begin; i < end; ++i) {
                     uint32_t u = shared_frontier[i];
@@ -465,8 +525,12 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     uint64_t coop_frontier_bytes = use_coop ? align64((uint64_t)team_count * N * sizeof(uint32_t)) : 0;
     uint64_t coop_ctrl_bytes     = use_coop ? align64((uint64_t)team_count * 64) : 0;
 
-    uint64_t total_bytes = row_bytes + adj_bytes + hdr_bytes + sample_bytes + all_deg_bytes
-                         + coop_dist_bytes + coop_frontier_bytes + coop_ctrl_bytes;
+    // Window Buffer Reuse: all_degree (used only during graph construction)
+    // shares space with coop_dist and coop_frontier (used only during SSSP)
+    uint64_t coop_needed_bytes   = coop_dist_bytes + coop_frontier_bytes;
+    uint64_t scratch_bytes       = std::max(all_deg_bytes, coop_needed_bytes);
+
+    uint64_t total_bytes = row_bytes + adj_bytes + hdr_bytes + sample_bytes + scratch_bytes + coop_ctrl_bytes;
 
     MPI_Win win;
     void *baseptr = nullptr;
@@ -489,13 +553,16 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     ptr += hdr_bytes;
     int32_t *sample_dist_flat = reinterpret_cast<int32_t *>(ptr);
     ptr += sample_bytes;
-    uint32_t *all_degree = reinterpret_cast<uint32_t *>(ptr);
-    ptr += all_deg_bytes;
-    uint32_t *coop_dist = reinterpret_cast<uint32_t *>(ptr);
-    ptr += coop_dist_bytes;
-    uint32_t *coop_frontier = reinterpret_cast<uint32_t *>(ptr);
-    ptr += coop_frontier_bytes;
+
+    char *scratch_base = ptr;
+    ptr += scratch_bytes;
+
     uint64_t *coop_work_index = reinterpret_cast<uint64_t *>(ptr);
+    ptr += coop_ctrl_bytes;
+
+    uint32_t *all_degree = reinterpret_cast<uint32_t *>(scratch_base);
+    uint32_t *coop_dist = reinterpret_cast<uint32_t *>(scratch_base);
+    uint32_t *coop_frontier = reinterpret_cast<uint32_t *>(scratch_base + coop_dist_bytes);
 
     // Each rank owns its distinct slice of all_degree: [shm_rank * N, (shm_rank + 1) * N)
     uint32_t *my_degree = all_degree + static_cast<uint64_t>(shm_rank) * N;
@@ -557,6 +624,184 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Win_sync(win);
 
     double t_pass1 = MPI_Wtime() - t1;
+
+#if ENABLE_DEDUP_PROFILE
+    {
+        // 1. Layered deterministic strided sampling across all ranks
+        const uint64_t sample_per_rank = std::min<uint64_t>(local_M, 500000ULL);
+        std::vector<uint64_t> local_sample_keys;
+        local_sample_keys.reserve(sample_per_rank);
+
+        uint64_t local_self_loops = 0;
+
+        for (uint64_t k = 0; k < sample_per_rank; ++k) {
+            uint64_t idx = static_cast<uint64_t>(
+                (static_cast<unsigned __int128>(k) * local_M) / sample_per_rank
+            );
+            uint64_t packed = packed_edges[idx];
+            uint32_t uk = static_cast<uint32_t>(packed >> 34);
+            uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
+
+            if (uk == vk) {
+                local_self_loops++;
+            } else {
+                uint32_t lo = std::min(uk, vk);
+                uint32_t hi = std::max(uk, vk);
+                local_sample_keys.push_back((static_cast<uint64_t>(lo) << 32) | hi);
+            }
+        }
+
+        // Rank-local sort + unique
+        std::vector<uint64_t> local_sorted = local_sample_keys;
+        std::sort(local_sorted.begin(), local_sorted.end());
+        auto uend = std::unique(local_sorted.begin(), local_sorted.end());
+        uint64_t local_unique = uend - local_sorted.begin();
+        uint64_t local_nonloops = local_sample_keys.size();
+        uint64_t local_dups = local_nonloops - local_unique;
+        double local_unique_ratio = (local_nonloops > 0) ? (double)local_unique / local_nonloops : 1.0;
+        std::vector<uint64_t>().swap(local_sorted);
+
+        // Gather all non-loop sample keys to rank 0 for Global Sample Sort + Unique
+        int sendcount = static_cast<int>(local_nonloops);
+        std::vector<int> recvcounts(world_size, 0);
+        MPI_Gather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        std::vector<int> displs(world_size, 0);
+        int total_gathered_count = 0;
+        if (world_rank == 0) {
+            for (int r = 0; r < world_size; ++r) {
+                displs[r] = total_gathered_count;
+                total_gathered_count += recvcounts[r];
+            }
+        }
+
+        std::vector<uint64_t> all_sample_keys;
+        if (world_rank == 0) {
+            all_sample_keys.resize(total_gathered_count);
+        }
+
+        MPI_Gatherv(local_sample_keys.data(), sendcount, MPI_UINT64_T,
+                    all_sample_keys.data(), recvcounts.data(), displs.data(), MPI_UINT64_T,
+                    0, MPI_COMM_WORLD);
+
+        std::vector<uint64_t>().swap(local_sample_keys); // Free local buffer
+
+        uint64_t global_sample_unique = 0;
+        uint64_t global_sample_dups = 0;
+        double global_sample_unique_pct = 0.0;
+        double global_sample_dup_pct = 0.0;
+
+        if (world_rank == 0) {
+            std::sort(all_sample_keys.begin(), all_sample_keys.end());
+            auto g_last = std::unique(all_sample_keys.begin(), all_sample_keys.end());
+            global_sample_unique = g_last - all_sample_keys.begin();
+            global_sample_dups = total_gathered_count - global_sample_unique;
+            if (total_gathered_count > 0) {
+                global_sample_unique_pct = 100.0 * (double)global_sample_unique / total_gathered_count;
+                global_sample_dup_pct = 100.0 * (double)global_sample_dups / total_gathered_count;
+            }
+            std::vector<uint64_t>().swap(all_sample_keys); // Free gathered buffer
+        }
+
+        // Rank-local reductions
+        uint64_t tot_sampled = 0, tot_self_loops = 0, tot_nonloops = 0;
+        uint64_t tot_local_unique = 0, tot_local_dups = 0;
+        double min_local_ratio = 1.0, max_local_ratio = 0.0;
+
+        MPI_Reduce(&sample_per_rank, &tot_sampled, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_self_loops, &tot_self_loops, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_nonloops, &tot_nonloops, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_unique, &tot_local_unique, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_dups, &tot_local_dups, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_unique_ratio, &min_local_ratio, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_unique_ratio, &max_local_ratio, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+        // 2. Full-Graph HyperLogLog (HLL) Cardinality Estimator (262,144 registers, p=18)
+        constexpr int HLL_P = 18;
+        constexpr uint32_t HLL_M_REG = 1u << HLL_P; // 262144
+        std::vector<uint8_t> hll_local(HLL_M_REG, 0);
+
+        uint64_t local_hll_nonloops = 0;
+        for (uint64_t k = 0; k < local_M; ++k) {
+            uint64_t packed = packed_edges[k];
+            uint32_t uk = static_cast<uint32_t>(packed >> 34);
+            uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
+            if (uk == vk) continue;
+            local_hll_nonloops++;
+
+            uint32_t lo = std::min(uk, vk);
+            uint32_t hi = std::max(uk, vk);
+            uint64_t key = (static_cast<uint64_t>(lo) << 32) | hi;
+            uint64_t h = mix_hash(key ^ 0x9e3779b97f4a7c15ULL);
+
+            uint32_t j = h >> (64 - HLL_P);
+            uint64_t w = h & ((1ULL << (64 - HLL_P)) - 1);
+            uint8_t rho = (w == 0) ? (64 - HLL_P + 1) : static_cast<uint8_t>(__builtin_clzll(w) - HLL_P + 1);
+            hll_local[j] = std::max(hll_local[j], rho);
+        }
+
+        std::vector<uint8_t> hll_global;
+        if (world_rank == 0) hll_global.resize(HLL_M_REG);
+
+        MPI_Reduce(hll_local.data(), hll_global.data(), HLL_M_REG, MPI_UINT8_T, MPI_MAX, 0, MPI_COMM_WORLD);
+        std::vector<uint8_t>().swap(hll_local);
+
+        uint64_t tot_hll_nonloops = 0;
+        MPI_Reduce(&local_hll_nonloops, &tot_hll_nonloops, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        if (world_rank == 0) {
+            // Compute HLL estimate
+            double harmonic_sum = 0.0;
+            int zero_regs = 0;
+            for (uint32_t j = 0; j < HLL_M_REG; ++j) {
+                harmonic_sum += std::pow(2.0, -static_cast<double>(hll_global[j]));
+                if (hll_global[j] == 0) zero_regs++;
+            }
+            double alpha_m = 0.72134;
+            double hll_est = alpha_m * static_cast<double>(HLL_M_REG) * static_cast<double>(HLL_M_REG) / harmonic_sum;
+            if (hll_est <= 2.5 * HLL_M_REG && zero_regs > 0) {
+                hll_est = static_cast<double>(HLL_M_REG) * std::log(static_cast<double>(HLL_M_REG) / zero_regs);
+            }
+            double hll_unique_pct = (tot_hll_nonloops > 0) ? (100.0 * hll_est / tot_hll_nonloops) : 0.0;
+            double hll_dup_pct = std::max(0.0, 100.0 - hll_unique_pct);
+
+            double self_pct = (tot_sampled > 0) ? (100.0 * (double)tot_self_loops / tot_sampled) : 0.0;
+            double local_unique_pct = (tot_nonloops > 0) ? (100.0 * (double)tot_local_unique / tot_nonloops) : 0.0;
+            double local_dup_pct = (tot_nonloops > 0) ? (100.0 * (double)tot_local_dups / tot_nonloops) : 0.0;
+
+            std::printf("\n=================================================================================\n");
+            std::printf("  [DEDUP PROFILER: Scale %d, Edgefactor %d, Scramble %d]\n", p.scale, p.edgefactor, p.scramble);
+            std::printf("---------------------------------------------------------------------------------\n");
+            std::printf("  [Sampled Level: %llu edges total (%llu/rank)]\n",
+                        (unsigned long long)tot_sampled, (unsigned long long)sample_per_rank);
+            std::printf("    Self-Loops:                  %llu (%.4f%%)\n",
+                        (unsigned long long)tot_self_loops, self_pct);
+            std::printf("    Weighted Rank-Local Unique:  %llu (%.4f%% of non-loops)\n",
+                        (unsigned long long)tot_local_unique, local_unique_pct);
+            std::printf("    Weighted Rank-Local Dup:     %llu (%.4f%% of non-loops)\n",
+                        (unsigned long long)tot_local_dups, local_dup_pct);
+            std::printf("    Min/Max Per-Rank Unique:     [Min: %.4f%%, Max: %.4f%%]\n",
+                        min_local_ratio * 100.0, max_local_ratio * 100.0);
+            std::printf("    Global Sampled Unique:       %llu (%.4f%% of sample)\n",
+                        (unsigned long long)global_sample_unique, global_sample_unique_pct);
+            std::printf("    Global Sampled Duplicate:    %llu (%.4f%% of sample)\n",
+                        (unsigned long long)global_sample_dups, global_sample_dup_pct);
+            std::printf("---------------------------------------------------------------------------------\n");
+            std::printf("  [Full-Graph HLL Estimate: 100%% of %llu non-loop edges scanned]\n",
+                        (unsigned long long)tot_hll_nonloops);
+            std::printf("    Estimated Global Unique:     %.0f (%.4f%% of total)\n",
+                        hll_est, hll_unique_pct);
+            std::printf("    Estimated Global Duplicate:  %.0f (%.4f%% of total)\n",
+                        tot_hll_nonloops - hll_est, hll_dup_pct);
+            std::printf("    HLL Theoretical Std Error:   ±0.20%%\n");
+            std::printf("=================================================================================\n\n");
+            std::fflush(stdout);
+
+            std::vector<uint8_t>().swap(hll_global);
+        }
+    }
+#endif
+
     double t2 = MPI_Wtime();
 
     // Parallel Prefix Sum & Rank-Relative Offset calculation (Absolute Cursor)
@@ -605,22 +850,234 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         }
     }
 
+#if ENABLE_BOUNDARY_PROFILE
+    if (world_rank == 0) {
+        int P = world_size;
+        uint64_t total_adj = row[N];
+        uint64_t avg_adj_target = total_adj / P;
+
+        std::vector<uint64_t> boundary(P + 1);
+        boundary[0] = 0;
+        boundary[P] = N;
+
+        for (int r = 1; r < P; ++r) {
+            uint64_t target = (total_adj * static_cast<uint64_t>(r)) / P;
+            auto it = std::lower_bound(row, row + N + 1, target);
+            uint64_t v = it - row;
+            if (v > 0 && v <= N) {
+                if (std::abs(static_cast<int64_t>(row[v]) - static_cast<int64_t>(target)) >
+                    std::abs(static_cast<int64_t>(row[v - 1]) - static_cast<int64_t>(target))) {
+                    v = v - 1;
+                }
+            }
+            if (v < boundary[r - 1]) v = boundary[r - 1];
+            if (v > N) v = N;
+            boundary[r] = v;
+        }
+
+        std::vector<uint64_t> owner_V(P);
+        std::vector<uint64_t> owner_adj(P);
+        uint64_t max_owner_adj = 0;
+        uint64_t min_nonempty_adj = UINT64_MAX;
+        uint64_t max_owner_V = 0;
+        int empty_owners = 0;
+
+        for (int r = 0; r < P; ++r) {
+            owner_V[r] = boundary[r + 1] - boundary[r];
+            owner_adj[r] = row[boundary[r + 1]] - row[boundary[r]];
+            if (owner_adj[r] > max_owner_adj) max_owner_adj = owner_adj[r];
+            if (owner_adj[r] > 0 && owner_adj[r] < min_nonempty_adj) min_nonempty_adj = owner_adj[r];
+            if (owner_V[r] > max_owner_V) max_owner_V = owner_V[r];
+            if (owner_V[r] == 0) empty_owners++;
+        }
+        if (min_nonempty_adj == UINT64_MAX) min_nonempty_adj = 0;
+
+        uint64_t max_vertex_degree = 0;
+        uint64_t max_deg_vertex = 0;
+        for (uint64_t v = 0; v < N; ++v) {
+            uint64_t deg = row[v + 1] - row[v];
+            if (deg > max_vertex_degree) {
+                max_vertex_degree = deg;
+                max_deg_vertex = v;
+            }
+        }
+
+        constexpr int COARSE_BITS = 14;
+        const int shift = (p.scale > COARSE_BITS) ? (p.scale - COARSE_BITS) : 0;
+        const uint64_t num_blocks = (N + (1ULL << shift) - 1) >> shift;
+        std::vector<uint32_t> coarse_owner(num_blocks);
+
+        for (uint64_t b = 0; b < num_blocks; ++b) {
+            uint64_t v_start = b << shift;
+            if (v_start >= N) v_start = N - 1;
+            auto it = std::upper_bound(boundary.begin(), boundary.end(), v_start);
+            int o = static_cast<int>(it - boundary.begin()) - 1;
+            if (o < 0) o = 0;
+            if (o >= P) o = P - 1;
+            coarse_owner[b] = static_cast<uint32_t>(o);
+        }
+
+        uint64_t test_verts = std::min<uint64_t>(N, 10000000ULL);
+        uint64_t test_stride = (N > test_verts) ? (N / test_verts) : 1;
+        uint64_t total_steps = 0;
+        uint32_t max_steps = 0;
+        uint64_t tested_count = 0;
+        bool lookup_all_correct = true;
+
+        for (uint64_t v = 0; v < N; v += test_stride) {
+            tested_count++;
+            uint64_t b = v >> shift;
+            int owner = coarse_owner[b];
+            int initial_owner = owner;
+
+            while (owner > 0 && v < boundary[owner]) owner--;
+            while (owner + 1 < P && v >= boundary[owner + 1]) owner++;
+
+            uint32_t steps = std::abs(owner - initial_owner);
+            total_steps += steps;
+            if (steps > max_steps) max_steps = steps;
+
+            if (v < boundary[owner] || v >= boundary[owner + 1]) {
+                lookup_all_correct = false;
+            }
+        }
+
+        int duplicate_boundaries = 0;
+        for (int r = 1; r < P; ++r) {
+            if (boundary[r] == boundary[r - 1]) duplicate_boundaries++;
+        }
+
+        uint64_t max_private_mem_bytes = 0;
+        for (int r = 0; r < P; ++r) {
+            uint64_t cursor_bytes = owner_V[r] * sizeof(uint32_t);
+            uint64_t packed_bytes = ((M + P - 1) / P) * sizeof(uint64_t);
+            uint64_t worst_staging = 96ULL * 1024 * 1024; // 96 MiB conservative staging peak
+            uint64_t total_est = cursor_bytes + packed_bytes + worst_staging;
+            if (total_est > max_private_mem_bytes) max_private_mem_bytes = total_est;
+        }
+
+        double avg_steps = (tested_count > 0) ? (static_cast<double>(total_steps) / tested_count) : 0.0;
+        double max_imbalance = (avg_adj_target > 0) ? (static_cast<double>(max_owner_adj) / avg_adj_target) : 1.0;
+
+        std::printf("\n=================================================================================\n");
+        std::printf("  [MILESTONE 7.1: BOUNDARY & OWNER PROFILER (Scale %d, EF %d, Scr %d, P=%d)]\n",
+                    p.scale, p.edgefactor, p.scramble, P);
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  Total Vertices N:             %llu\n", (unsigned long long)N);
+        std::printf("  Total Adjacencies (2*M):      %llu\n", (unsigned long long)total_adj);
+        std::printf("  Average Target per Owner:     %llu\n", (unsigned long long)avg_adj_target);
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  [Super-Hub & Degree Analysis]\n");
+        std::printf("  Maximum Vertex Degree:        %llu (at vertex %llu)\n",
+                    (unsigned long long)max_vertex_degree, (unsigned long long)max_deg_vertex);
+        if (max_vertex_degree > avg_adj_target) {
+            std::printf("  WARNING: Super-Hub degree EXCEEDS average owner target by %.2fx!\n",
+                        (double)max_vertex_degree / avg_adj_target);
+        } else {
+            std::printf("  Super-Hub degree vs Target:   %.2f%% of target (Fits inside single owner)\n",
+                        100.0 * max_vertex_degree / avg_adj_target);
+        }
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  [Owner Load Balance Analysis]\n");
+        std::printf("  Max Owner Adjacency:          %llu (%.4fx avg target)\n",
+                    (unsigned long long)max_owner_adj, max_imbalance);
+        std::printf("  Min Non-Empty Adjacency:      %llu (%.4fx avg target)\n",
+                    (unsigned long long)min_nonempty_adj,
+                    (avg_adj_target > 0 ? (double)min_nonempty_adj / avg_adj_target : 0.0));
+        std::printf("  Empty Owners Count:           %d / %d\n", empty_owners, P);
+        std::printf("  Duplicate Boundaries Count:   %d / %d\n", duplicate_boundaries, P);
+        std::printf("  Max Owner Vertex Count (local_V): %llu (Avg: %llu, %.2fx avg)\n",
+                    (unsigned long long)max_owner_V, (unsigned long long)(N / P),
+                    (double)max_owner_V / (N / P));
+        std::printf("  Max Private Memory Estimate:  %.2f MiB (Budget: 1200 MiB, Margin: %.2f MiB)\n",
+                    (double)max_private_mem_bytes / (1024.0 * 1024.0),
+                    1200.0 - (double)max_private_mem_bytes / (1024.0 * 1024.0));
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  [Coarse Lookup (Shift=%d, %llu Blocks, %llu Checked)]\n",
+                    shift, (unsigned long long)num_blocks, (unsigned long long)tested_count);
+        std::printf("  Lookup Verification:          %s\n", lookup_all_correct ? "100% PASSED" : "FAILED!");
+        std::printf("  Correction Steps:             Avg = %.4f, Max = %u\n", avg_steps, max_steps);
+        std::printf("=================================================================================\n\n");
+        std::fflush(stdout);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
     double t_prefix = MPI_Wtime() - t2;
     double t3 = MPI_Wtime();
 
     // Pass 2: fill adj (lock-free) with Absolute Cursor
+#if PASS2_MODE == 0
 #if CACHE_EDGES
-    for (uint64_t k = 0; k < local_M; k++) {
-        uint64_t packed = packed_edges[k];
-        uint32_t uk = static_cast<uint32_t>(packed >> 34);
-        uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
-        uint8_t wk  = static_cast<uint8_t>(packed);
+    if (p.scale >= 24) {
+#ifndef RADIX_BITS
+#define RADIX_BITS 8
+#endif
+        constexpr uint32_t NUM_BUCKETS = 1u << RADIX_BITS;
+        const int bucket_shift = (p.scale > RADIX_BITS) ? (p.scale - RADIX_BITS) : 0;
+        const uint64_t RADIX_CHUNK = 8388608; // 8M edges per chunk (128 MB working buffer)
+        std::vector<uint64_t> bucketed_edges;
+        std::vector<uint32_t> bcount(NUM_BUCKETS);
+        std::vector<uint32_t> boffset(NUM_BUCKETS);
+        std::vector<uint32_t> bcurr(NUM_BUCKETS);
 
-        uint64_t pu = my_degree[uk]++;
-        adj[pu] = {vk, wk};
+        for (uint64_t chunk_start = 0; chunk_start < local_M; chunk_start += RADIX_CHUNK) {
+            uint64_t chunk_len = std::min(RADIX_CHUNK, local_M - chunk_start);
+            uint64_t total_dir = chunk_len * 2;
+            if (bucketed_edges.size() < total_dir) bucketed_edges.resize(total_dir);
 
-        uint64_t pv = my_degree[vk]++;
-        adj[pv] = {uk, wk};
+            std::fill(bcount.begin(), bcount.end(), 0);
+            for (uint64_t k = 0; k < chunk_len; ++k) {
+                uint64_t packed = packed_edges[chunk_start + k];
+                uint32_t uk = static_cast<uint32_t>(packed >> 34);
+                uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
+                bcount[uk >> bucket_shift]++;
+                bcount[vk >> bucket_shift]++;
+            }
+
+            boffset[0] = 0;
+            for (uint32_t b = 1; b < NUM_BUCKETS; ++b) boffset[b] = boffset[b - 1] + bcount[b - 1];
+            std::memcpy(bcurr.data(), boffset.data(), NUM_BUCKETS * sizeof(uint32_t));
+
+            for (uint64_t k = 0; k < chunk_len; ++k) {
+                uint64_t packed = packed_edges[chunk_start + k];
+                uint32_t uk = static_cast<uint32_t>(packed >> 34);
+                uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
+                uint8_t  wk = static_cast<uint8_t>(packed);
+
+                bucketed_edges[bcurr[uk >> bucket_shift]++] = (static_cast<uint64_t>(uk) << 34) |
+                                                              (static_cast<uint64_t>(vk) << 8) | wk;
+                bucketed_edges[bcurr[vk >> bucket_shift]++] = (static_cast<uint64_t>(vk) << 34) |
+                                                              (static_cast<uint64_t>(uk) << 8) | wk;
+            }
+
+            for (uint32_t b = 0; b < NUM_BUCKETS; ++b) {
+                uint32_t b_start = boffset[b];
+                uint32_t b_end   = (b == NUM_BUCKETS - 1) ? static_cast<uint32_t>(total_dir) : boffset[b + 1];
+                for (uint32_t i = b_start; i < b_end; ++i) {
+                    uint64_t item = bucketed_edges[i];
+                    uint32_t u = static_cast<uint32_t>(item >> 34);
+                    uint32_t v = static_cast<uint32_t>((item >> 8) & 0x3ffffffu);
+                    uint8_t  w = static_cast<uint8_t>(item);
+
+                    uint64_t pu = my_degree[u]++;
+                    adj[pu] = {v, w};
+                }
+            }
+        }
+    } else {
+        for (uint64_t k = 0; k < local_M; k++) {
+            uint64_t packed = packed_edges[k];
+            uint32_t uk = static_cast<uint32_t>(packed >> 34);
+            uint32_t vk = static_cast<uint32_t>((packed >> 8) & 0x3ffffffu);
+            uint8_t wk  = static_cast<uint8_t>(packed);
+
+            uint64_t pu = my_degree[uk]++;
+            adj[pu] = {vk, wk};
+
+            uint64_t pv = my_degree[vk]++;
+            adj[pv] = {uk, wk};
+        }
     }
 #else
     for (uint64_t i = edge_begin; i < edge_end; ++i) {
@@ -645,7 +1102,326 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     std::vector<uint64_t>().swap(packed_edges);
 #endif
 
+#elif PASS2_MODE == 1
+    // Milestone 7.2A: Vertex-Owner Direct Scatter Pass 2
+    int P = world_size;
+    uint64_t total_adj = row[N];
+
+    // 1. Degree-balanced boundaries
+    std::vector<uint64_t> boundary(P + 1);
+    boundary[0] = 0;
+    boundary[P] = N;
+
+    for (int r = 1; r < P; ++r) {
+        uint64_t target = (total_adj * static_cast<uint64_t>(r)) / P;
+        auto it = std::lower_bound(row, row + N + 1, target);
+        uint64_t v = it - row;
+        if (v > 0 && v <= N) {
+            if (std::abs(static_cast<int64_t>(row[v]) - static_cast<int64_t>(target)) >
+                std::abs(static_cast<int64_t>(row[v - 1]) - static_cast<int64_t>(target))) {
+                v = v - 1;
+            }
+        }
+        if (v < boundary[r - 1]) v = boundary[r - 1];
+        if (v > N) v = N;
+        boundary[r] = v;
+    }
+
+    // 2. Coarse Owner Lookup Table
+    constexpr int COARSE_BITS = 14;
+    const int shift = (p.scale > COARSE_BITS) ? (p.scale - COARSE_BITS) : 0;
+    const uint64_t num_blocks = (N + (1ULL << shift) - 1) >> shift;
+    std::vector<uint32_t> coarse_owner(num_blocks);
+
+    for (uint64_t b = 0; b < num_blocks; ++b) {
+        uint64_t v_start = b << shift;
+        if (v_start >= N) v_start = N - 1;
+        auto it = std::upper_bound(boundary.begin(), boundary.end(), v_start);
+        int o = static_cast<int>(it - boundary.begin()) - 1;
+        if (o < 0) o = 0;
+        if (o >= P) o = P - 1;
+        coarse_owner[b] = static_cast<uint32_t>(o);
+    }
+
+    auto get_owner = [&](uint32_t v) -> int {
+        int o = coarse_owner[v >> shift];
+        while (o > 0 && v < boundary[o]) o--;
+        while (o + 1 < P && v >= boundary[o + 1]) o++;
+        return o;
+    };
+
+    // 3. Initialize Cross-Round Local Cursor
+    uint64_t local_V = boundary[world_rank + 1] - boundary[world_rank];
+    std::vector<uint32_t> local_cursor(local_V);
+    for (uint64_t lv = 0; lv < local_V; ++lv) {
+        local_cursor[lv] = static_cast<uint32_t>(row[boundary[world_rank] + lv]);
+    }
+
+    // 4. Allocate Independent Mailbox Window
+    constexpr uint64_t CHUNK_UNDIRECTED = 262144; // 256K edges per chunk
+    const uint64_t mailbox_capacity = static_cast<uint64_t>(P) * 2 * CHUNK_UNDIRECTED;
+
+    MPI_Win mailbox_win;
+    uint64_t *mailbox = nullptr;
+    MPI_Aint mailbox_bytes = (shm_rank == 0) ? static_cast<MPI_Aint>(mailbox_capacity * sizeof(uint64_t)) : 0;
+    MPI_Win_allocate_shared(mailbox_bytes, sizeof(uint64_t), MPI_INFO_NULL, shm_comm, &mailbox, &mailbox_win);
+    if (shm_rank != 0) {
+        int disp_unit = 0;
+        MPI_Aint sz = 0;
+        MPI_Win_shared_query(mailbox_win, 0, &sz, &disp_unit, &mailbox);
+    }
+
+    // 5. Unified Round Calculation
+    uint64_t max_local_M = 0;
+    MPI_Allreduce(&local_M, &max_local_M, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+    uint64_t total_rounds = (max_local_M + CHUNK_UNDIRECTED - 1) / CHUNK_UNDIRECTED;
+
+    // Profiling variables
+    double t_count = 0.0;
+    double t_allgather = 0.0;
+    double t_offsets = 0.0;
+    double t_pack = 0.0;
+    double t_prod_sync = 0.0;
+    double t_owner_scatter = 0.0;
+    double t_owner_sync = 0.0;
+
+    double max_round_skew = 0.0;
+    double sum_round_skew = 0.0;
+    uint64_t worst_round_idx = 0;
+    uint64_t max_owner_total_overall = 0;
+
+    std::vector<uint64_t> my_counts(P);
+    std::vector<uint64_t> global_counts(static_cast<size_t>(P) * P);
+    std::vector<uint64_t> slice_offset(static_cast<size_t>(P) * P);
+    std::vector<uint64_t> slice_cur(P);
+    std::vector<uint64_t> owner_base(P);
+    std::vector<uint64_t> owner_total(P);
+
+    for (uint64_t rnd = 0; rnd < total_rounds; ++rnd) {
+        uint64_t chunk_start = rnd * CHUNK_UNDIRECTED;
+        uint64_t chunk_len = (chunk_start < local_M) ? std::min(CHUNK_UNDIRECTED, local_M - chunk_start) : 0;
+
+        // Step 1: Producer Count Pass
+#if ENABLE_PROFILE
+        double t_c0 = MPI_Wtime();
+#endif
+        std::fill(my_counts.begin(), my_counts.end(), 0ULL);
+        for (uint64_t k = 0; k < chunk_len; ++k) {
+            uint64_t p_edge = packed_edges[chunk_start + k];
+            uint32_t uk = static_cast<uint32_t>(p_edge >> 34);
+            uint32_t vk = static_cast<uint32_t>((p_edge >> 8) & 0x3ffffffu);
+            my_counts[get_owner(uk)]++;
+            my_counts[get_owner(vk)]++;
+        }
+#if ENABLE_PROFILE
+        t_count += (MPI_Wtime() - t_c0);
+        double t_g0 = MPI_Wtime();
+#endif
+
+        // Step 2: Collective Exchange of Counts
+        MPI_Allgather(my_counts.data(), P, MPI_UINT64_T,
+                      global_counts.data(), P, MPI_UINT64_T, MPI_COMM_WORLD);
+#if ENABLE_PROFILE
+        t_allgather += (MPI_Wtime() - t_g0);
+        double t_off0 = MPI_Wtime();
+#endif
+
+        // Step 3: Compute Owner-Major Offsets
+        uint64_t cur_pos = 0;
+        uint64_t cur_round_max_owner = 0;
+        for (int o = 0; o < P; ++o) {
+            owner_base[o] = cur_pos;
+            uint64_t o_cur = cur_pos;
+            for (int p_idx = 0; p_idx < P; ++p_idx) {
+                slice_offset[p_idx * P + o] = o_cur;
+                o_cur += global_counts[p_idx * P + o];
+            }
+            owner_total[o] = o_cur - cur_pos;
+#if ENABLE_PROFILE
+            if (owner_total[o] > cur_round_max_owner) cur_round_max_owner = owner_total[o];
+#endif
+            cur_pos = o_cur;
+        }
+#if ENABLE_PROFILE
+        t_offsets += (MPI_Wtime() - t_off0);
+
+        if (world_rank == 0) {
+            uint64_t tot_records = cur_pos;
+            double avg_owner = static_cast<double>(tot_records) / P;
+            double skew = (avg_owner > 0) ? (static_cast<double>(cur_round_max_owner) / avg_owner) : 1.0;
+            sum_round_skew += skew;
+            if (skew > max_round_skew) {
+                max_round_skew = skew;
+                worst_round_idx = rnd;
+            }
+            if (cur_round_max_owner > max_owner_total_overall) {
+                max_owner_total_overall = cur_round_max_owner;
+            }
+        }
+#endif
+
+#if ENABLE_DEBUG_INVARIANTS
+        if (cur_pos > mailbox_capacity) {
+            std::cerr << "Mailbox capacity overflow: " << cur_pos << " > " << mailbox_capacity << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+#endif
+
+        // Step 4: Producer Packing Pass
+#if ENABLE_PROFILE
+        double t_p0 = MPI_Wtime();
+#endif
+        for (int o = 0; o < P; ++o) {
+            slice_cur[o] = slice_offset[world_rank * P + o];
+        }
+        for (uint64_t k = 0; k < chunk_len; ++k) {
+            uint64_t p_edge = packed_edges[chunk_start + k];
+            uint32_t uk = static_cast<uint32_t>(p_edge >> 34);
+            uint32_t vk = static_cast<uint32_t>((p_edge >> 8) & 0x3ffffffu);
+            uint8_t  wk = static_cast<uint8_t>(p_edge);
+
+            int o_u = get_owner(uk);
+            int o_v = get_owner(vk);
+
+            uint64_t rec_u = (static_cast<uint64_t>(uk) << 34) | (static_cast<uint64_t>(vk) << 8) | wk;
+            uint64_t rec_v = (static_cast<uint64_t>(vk) << 34) | (static_cast<uint64_t>(uk) << 8) | wk;
+
+            mailbox[slice_cur[o_u]++] = rec_u;
+            mailbox[slice_cur[o_v]++] = rec_v;
+        }
+#if ENABLE_PROFILE
+        t_pack += (MPI_Wtime() - t_p0);
+#endif
+
+#if ENABLE_DEBUG_INVARIANTS
+        for (int o = 0; o < P; ++o) {
+            if (slice_cur[o] != slice_offset[world_rank * P + o] + my_counts[o]) {
+                std::cerr << "Producer slice mismatch for rank " << world_rank << " owner " << o << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+        }
+#endif
+
+        // Step 5: Producer Sync Wait
+#if ENABLE_PROFILE
+        double t_ps0 = MPI_Wtime();
+#endif
+        MPI_Win_sync(mailbox_win);
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Win_sync(mailbox_win);
+#if ENABLE_PROFILE
+        t_prod_sync += (MPI_Wtime() - t_ps0);
+#endif
+
+        // Step 6: Owner Sequential Read & CSR Direct Scatter
+#if ENABLE_PROFILE
+        double t_s0 = MPI_Wtime();
+#endif
+        uint64_t o_start = owner_base[world_rank];
+        uint64_t o_cnt   = owner_total[world_rank];
+        for (uint64_t i = 0; i < o_cnt; ++i) {
+            uint64_t rec = mailbox[o_start + i];
+            uint32_t src = static_cast<uint32_t>(rec >> 34);
+            uint32_t dst = static_cast<uint32_t>((rec >> 8) & 0x3ffffffu);
+            uint8_t  w   = static_cast<uint8_t>(rec);
+
+#if ENABLE_DEBUG_INVARIANTS
+            if (src < boundary[world_rank] || src >= boundary[world_rank + 1]) {
+                std::cerr << "Rank " << world_rank << " received invalid src " << src
+                          << " outside [" << boundary[world_rank] << ", " << boundary[world_rank + 1] << ")\n";
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+#endif
+
+            uint64_t local_src = src - boundary[world_rank];
+            uint32_t pos = local_cursor[local_src]++;
+            adj[pos] = {dst, w};
+        }
+#if ENABLE_PROFILE
+        t_owner_scatter += (MPI_Wtime() - t_s0);
+#endif
+
+        // Step 7: Owner Sync Wait
+#if ENABLE_PROFILE
+        double t_os0 = MPI_Wtime();
+#endif
+        MPI_Win_sync(win);
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Win_sync(mailbox_win);
+#if ENABLE_PROFILE
+        t_owner_sync += (MPI_Wtime() - t_os0);
+#endif
+    }
+
+    // Free Mailbox Window
+    MPI_Win_free(&mailbox_win);
+
+#if CACHE_EDGES
+    // Free packed_edges buffer before SSSP
+    std::vector<uint64_t>().swap(packed_edges);
+#endif
+
+#if ENABLE_DEBUG_INVARIANTS
+    uint64_t mismatch_count = 0;
+    for (uint64_t lv = 0; lv < local_V; ++lv) {
+        uint64_t v = boundary[world_rank] + lv;
+        if (local_cursor[lv] != static_cast<uint32_t>(row[v + 1])) {
+            mismatch_count++;
+        }
+    }
+    uint64_t tot_mismatches = 0;
+    MPI_Reduce(&mismatch_count, &tot_mismatches, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (world_rank == 0) {
+        if (tot_mismatches > 0) {
+            std::cerr << "FATAL: Total cursor mismatches = " << tot_mismatches << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        } else {
+            std::printf("  [INVARIANT CHECK: 100%% of vertices CSR cursor perfectly matches row[v+1]!]\n");
+        }
+    }
+#endif
+
+#if ENABLE_PROFILE
+    // Pass 2 timing breakdown
+    double times_p2[7] = {t_count, t_allgather, t_offsets, t_pack, t_prod_sync, t_owner_scatter, t_owner_sync};
+    double max_times_p2[7] = {0};
+    MPI_Reduce(times_p2, max_times_p2, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (world_rank == 0) {
+        double avg_skew = (total_rounds > 0) ? (sum_round_skew / total_rounds) : 1.0;
+        std::printf("\n=================================================================================\n");
+        std::printf("  [MILESTONE 7.2A: VERTEX-OWNER DIRECT SCATTER (Rounds: %llu, P: %d)]\n",
+                    (unsigned long long)total_rounds, P);
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  [Timing Breakdown (MPI_MAX across ranks)]\n");
+        std::printf("  Producer Count:               %.4f s\n", max_times_p2[0]);
+        std::printf("  Counts Allgather:             %.4f s\n", max_times_p2[1]);
+        std::printf("  Offset Calculation:           %.4f s\n", max_times_p2[2]);
+        std::printf("  Producer Pack:                %.4f s\n", max_times_p2[3]);
+        std::printf("  Producer Sync Wait:           %.4f s\n", max_times_p2[4]);
+        std::printf("  Owner Direct Scatter:         %.4f s\n", max_times_p2[5]);
+        std::printf("  Owner Sync Wait:              %.4f s\n", max_times_p2[6]);
+        std::printf("  Sum of Phase Maxima:          %.4f s\n",
+                    max_times_p2[0] + max_times_p2[1] + max_times_p2[2] + max_times_p2[3] +
+                    max_times_p2[4] + max_times_p2[5] + max_times_p2[6]);
+        std::printf("---------------------------------------------------------------------------------\n");
+        std::printf("  [Mailbox Skew Diagnostics]\n");
+        std::printf("  Average Owner Skew per Round: %.4fx\n", avg_skew);
+        std::printf("  Maximum Owner Skew across Rounds: %.4fx (Worst Round: %llu)\n",
+                    max_round_skew, (unsigned long long)worst_round_idx);
+        std::printf("  Maximum Owner Total in a Round:   %llu records\n",
+                    (unsigned long long)max_owner_total_overall);
+        std::printf("=================================================================================\n\n");
+        std::fflush(stdout);
+    }
+#endif
+
+#endif
+
     double t_pass2 = MPI_Wtime() - t3;
+#if PRINT_PASS2
+    if (world_rank == 0) std::printf("Pass 2 time: %.4f s\n", t_pass2);
+#endif
     double t4 = MPI_Wtime();
 
     // 4. SSSP Execution
@@ -771,8 +1547,8 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         }
     }
 
+#if ENABLE_PROFILE
     double t_copy = MPI_Wtime() - t5;
-
     double times[6] = {t_alloc, t_pass1, t_prefix, t_pass2, t_sssp, t_copy};
     double max_times[6] = {0};
     MPI_Reduce(times, max_times, 6, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -797,6 +1573,7 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                         (unsigned long long)max_rounds, max_coll_time, max_relax_time, (unsigned long long)total_front);
         }
     }
+#endif
 
     // 6. Clean up MPI resources
     MPI_Win_free(&win);
