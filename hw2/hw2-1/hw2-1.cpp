@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 #include <immintrin.h>
+#include <numeric>
 
 #include "graph_gen.hpp"
 
@@ -573,11 +574,101 @@ void dial(const uint64_t *row, const CSRNeighbor *adj,
     }
 }
 
+#if ENABLE_PROFILE
+struct RoundSummary {
+    uint32_t src_idx = 0;
+    uint32_t round_idx = 0;
+    uint32_t distance = 0;
+    uint64_t frontier_size = 0;
+    uint64_t total_degree = 0;
+    uint64_t max_degree = 0;
+    double avg_degree = 0.0;
+    uint64_t max_scanned_edges = 0;
+    uint64_t min_scanned_edges = 0;
+    double avg_scanned_edges = 0.0;
+    double edge_imbalance_ratio = 1.0;
+    double max_relax_time = 0.0;
+    double min_relax_time = 0.0;
+    double avg_relax_time = 0.0;
+    double time_imbalance_ratio = 1.0;
+    double barrier_skew = 0.0;
+    uint32_t hubs_gt_1k = 0;
+    uint32_t hubs_gt_4k = 0;
+    uint32_t hubs_gt_16k = 0;
+    uint32_t hubs_gt_64k = 0;
+    uint64_t edges_gt_1k = 0;
+    uint64_t edges_gt_4k = 0;
+    uint64_t edges_gt_16k = 0;
+    uint64_t edges_gt_64k = 0;
+};
+
+struct PhaseTimers {
+    double t_alloc = 0.0;
+    // Pass 1
+    double t_p1_gen = 0.0;
+    double t_p1_store_deg = 0.0;
+    double t_p1_sync = 0.0;
+    double t_p1_total = 0.0;
+    // Prefix
+    double t_pref_agg = 0.0;
+    double t_pref_scan = 0.0;
+    double t_pref_cursor = 0.0;
+    double t_pref_sync = 0.0;
+    double t_pref_total = 0.0;
+    // Pass 2
+    double t_p2_count = 0.0;
+    double t_p2_scatter = 0.0;
+    double t_p2_fill = 0.0;
+    double t_p2_sync = 0.0;
+    double t_p2_total = 0.0;
+    // SSSP
+    double t_sssp_init = 0.0;
+    double t_sssp_relax = 0.0;
+    double t_sssp_coll = 0.0;
+    double t_sssp_result = 0.0;
+    double t_sssp_total = 0.0;
+    // Copy
+    double t_copy = 0.0;
+    // Actual Run Total
+    double t_run_total = 0.0;
+
+    void to_array(double arr[22]) const {
+        arr[0] = t_alloc;
+        arr[1] = t_p1_total;
+        arr[2] = t_p1_gen;
+        arr[3] = t_p1_store_deg;
+        arr[4] = t_p1_sync;
+        arr[5] = t_pref_total;
+        arr[6] = t_pref_agg;
+        arr[7] = t_pref_scan;
+        arr[8] = t_pref_cursor;
+        arr[9] = t_pref_sync;
+        arr[10] = t_p2_total;
+        arr[11] = t_p2_count;
+        arr[12] = t_p2_scatter;
+        arr[13] = t_p2_fill;
+        arr[14] = t_p2_sync;
+        arr[15] = t_sssp_total;
+        arr[16] = t_sssp_init;
+        arr[17] = t_sssp_relax;
+        arr[18] = t_sssp_coll;
+        arr[19] = t_sssp_result;
+        arr[20] = t_copy;
+        arr[21] = t_run_total;
+    }
+};
+#endif
+
 struct SSSPStats {
     uint64_t rounds = 0;
     uint64_t total_frontier = 0;
     double collective_time = 0.0;
     double relax_time = 0.0;
+    double init_time = 0.0;
+    double result_time = 0.0;
+#if ENABLE_PROFILE
+    std::vector<RoundSummary> round_summaries;
+#endif
 };
 
 // Cooperative Dial's algorithm for a team of ranks
@@ -589,6 +680,9 @@ void cooperative_dial(
     MPI_Comm team_comm, int team_rank, int team_size, MPI_Win win,
     SSSPStats &stats)
 {
+#if ENABLE_PROFILE
+    double t_init_0 = MPI_Wtime();
+#endif
     // 1. Parallel initialize dist
     const uint64_t v_begin = (N * static_cast<uint64_t>(team_rank)) / team_size;
     const uint64_t v_end   = (N * static_cast<uint64_t>(team_rank + 1)) / team_size;
@@ -608,6 +702,9 @@ void cooperative_dial(
     MPI_Win_sync(win);
     MPI_Barrier(team_comm);
     MPI_Win_sync(win);
+#if ENABLE_PROFILE
+    stats.init_time += (MPI_Wtime() - t_init_0);
+#endif
 
     uint32_t current = 0;
 
@@ -633,6 +730,32 @@ void cooperative_dial(
         if (total_count > 0) {
 #if ENABLE_PROFILE
             stats.total_frontier += total_count;
+
+            // Phase 1: Hub & Degree distribution of shared frontier
+            uint64_t loc_tot_deg = 0;
+            uint64_t loc_max_deg = 0;
+            uint32_t loc_hubs[4] = {0, 0, 0, 0}; // >1k, >4k, >16k, >64k
+            uint64_t loc_hub_edges[4] = {0, 0, 0, 0};
+
+            for (uint32_t x : my_bucket) {
+                if (dist[x] != current) continue;
+                uint64_t deg = row[x + 1] - row[x];
+                loc_tot_deg += deg;
+                if (deg > loc_max_deg) loc_max_deg = deg;
+                if (deg > 1024)  { loc_hubs[0]++; loc_hub_edges[0] += deg; }
+                if (deg > 4096)  { loc_hubs[1]++; loc_hub_edges[1] += deg; }
+                if (deg > 16384) { loc_hubs[2]++; loc_hub_edges[2] += deg; }
+                if (deg > 65536) { loc_hubs[3]++; loc_hub_edges[3] += deg; }
+            }
+
+            uint64_t round_tot_deg = 0, round_max_deg = 0;
+            uint32_t round_hubs[4] = {0, 0, 0, 0};
+            uint64_t round_hub_edges[4] = {0, 0, 0, 0};
+
+            MPI_Reduce(&loc_tot_deg, &round_tot_deg, 1, MPI_UINT64_T, MPI_SUM, 0, team_comm);
+            MPI_Reduce(&loc_max_deg, &round_max_deg, 1, MPI_UINT64_T, MPI_MAX, 0, team_comm);
+            MPI_Reduce(loc_hubs, round_hubs, 4, MPI_UINT32_T, MPI_SUM, 0, team_comm);
+            MPI_Reduce(loc_hub_edges, round_hub_edges, 4, MPI_UINT64_T, MPI_SUM, 0, team_comm);
 #endif
 
             if (local_count > 0) {
@@ -653,6 +776,7 @@ void cooperative_dial(
 #if ENABLE_PROFILE
             stats.collective_time += (MPI_Wtime() - tc1);
 
+            uint64_t my_scanned_edges = 0;
             double tr0 = MPI_Wtime();
 #endif
             // 3. Dynamic work chunk distribution across team ranks
@@ -666,7 +790,12 @@ void cooperative_dial(
                     uint32_t x = shared_frontier[i];
                     if (dist[x] != current) continue; // stale
 
-                    for (uint64_t e = row[x]; e < row[x + 1]; ++e) {
+                    uint64_t rx_begin = row[x];
+                    uint64_t rx_end   = row[x + 1];
+#if ENABLE_PROFILE
+                    my_scanned_edges += (rx_end - rx_begin);
+#endif
+                    for (uint64_t e = rx_begin; e < rx_end; ++e) {
                         uint32_t y = adj[e].to;
                         uint32_t nd = current + static_cast<uint32_t>(adj[e].w);
                         if (atomic_min_u32(&dist[y], nd)) {
@@ -676,7 +805,60 @@ void cooperative_dial(
                 }
             }
 #if ENABLE_PROFILE
-            stats.relax_time += (MPI_Wtime() - tr0);
+            double my_relax_time = MPI_Wtime() - tr0;
+            stats.relax_time += my_relax_time;
+
+            std::vector<uint64_t> all_scanned(team_size);
+            std::vector<double> all_times(team_size);
+            MPI_Gather(&my_scanned_edges, 1, MPI_UINT64_T, all_scanned.data(), 1, MPI_UINT64_T, 0, team_comm);
+            MPI_Gather(&my_relax_time, 1, MPI_DOUBLE, all_times.data(), 1, MPI_DOUBLE, 0, team_comm);
+
+            if (team_rank == 0) {
+                uint64_t max_e = 0, min_e = ~0ULL, sum_e = 0;
+                double max_t = 0.0, min_t = 1e9, sum_t = 0.0;
+                for (int r = 0; r < team_size; ++r) {
+                    if (all_scanned[r] > max_e) max_e = all_scanned[r];
+                    if (all_scanned[r] < min_e) min_e = all_scanned[r];
+                    sum_e += all_scanned[r];
+
+                    if (all_times[r] > max_t) max_t = all_times[r];
+                    if (all_times[r] < min_t) min_t = all_times[r];
+                    sum_t += all_times[r];
+                }
+                double avg_e = (team_size > 0) ? (static_cast<double>(sum_e) / team_size) : 0.0;
+                double edge_imbalance = (avg_e > 0.0) ? (static_cast<double>(max_e) / avg_e) : 1.0;
+                double avg_t = (team_size > 0) ? (sum_t / team_size) : 0.0;
+                double time_imbalance = (avg_t > 0.0) ? (max_t / avg_t) : 1.0;
+                double barrier_skew = (max_t >= min_t) ? (max_t - min_t) : 0.0;
+
+                RoundSummary rinfo{};
+                rinfo.src_idx = static_cast<uint32_t>(src);
+                rinfo.round_idx = static_cast<uint32_t>(stats.rounds);
+                rinfo.distance = current;
+                rinfo.frontier_size = total_count;
+                rinfo.total_degree = round_tot_deg;
+                rinfo.max_degree = round_max_deg;
+                rinfo.avg_degree = (total_count > 0) ? (static_cast<double>(round_tot_deg) / total_count) : 0.0;
+                rinfo.max_scanned_edges = max_e;
+                rinfo.min_scanned_edges = (min_e == ~0ULL) ? 0 : min_e;
+                rinfo.avg_scanned_edges = avg_e;
+                rinfo.edge_imbalance_ratio = edge_imbalance;
+                rinfo.max_relax_time = max_t;
+                rinfo.min_relax_time = (min_t >= 1e8) ? 0.0 : min_t;
+                rinfo.avg_relax_time = avg_t;
+                rinfo.time_imbalance_ratio = time_imbalance;
+                rinfo.barrier_skew = barrier_skew;
+                rinfo.hubs_gt_1k = round_hubs[0];
+                rinfo.hubs_gt_4k = round_hubs[1];
+                rinfo.hubs_gt_16k = round_hubs[2];
+                rinfo.hubs_gt_64k = round_hubs[3];
+                rinfo.edges_gt_1k = round_hub_edges[0];
+                rinfo.edges_gt_4k = round_hub_edges[1];
+                rinfo.edges_gt_16k = round_hub_edges[2];
+                rinfo.edges_gt_64k = round_hub_edges[3];
+
+                stats.round_summaries.push_back(rinfo);
+            }
 
             double tc2 = MPI_Wtime();
 #endif
@@ -851,7 +1033,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
 #if ENABLE_PROFILE
-    double t0 = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_run_start = MPI_Wtime();
+    double t0 = t_run_start;
+    PhaseTimers timers;
 #endif
 
     // 1. Create shared communicator for processes on the same node
@@ -971,7 +1156,7 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Win_sync(win);
 
 #if ENABLE_PROFILE
-    double t_alloc = MPI_Wtime() - t0;
+    timers.t_alloc = MPI_Wtime() - t0;
     double t1 = MPI_Wtime();
 #endif
 
@@ -994,6 +1179,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     // Pass 1: count degrees (and optionally cache packed edges)
     for (uint64_t i = edge_begin; i < edge_end; i += CHUNK) {
         uint64_t chunk_len = std::min(CHUNK, edge_end - i);
+#if ENABLE_PROFILE
+        double tg0 = MPI_Wtime();
+#endif
 #if GEN_MODE == 1
         uint64_t k = 0;
         for (; k + 4 <= chunk_len; k += 4) {
@@ -1026,6 +1214,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             gctx.generate(i + k, u[k], v[k], w_chunk[k]);
         }
 #endif
+#if ENABLE_PROFILE
+        timers.t_p1_gen += (MPI_Wtime() - tg0);
+        double ts0 = MPI_Wtime();
+#endif
         uint64_t base_idx = i - edge_begin;
         for (uint64_t k = 0; k < chunk_len; k++) {
             uint32_t uk = u[k], vk = v[k];
@@ -1040,6 +1232,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                                          static_cast<uint64_t>(wk);
 #endif
         }
+#if ENABLE_PROFILE
+        timers.t_p1_store_deg += (MPI_Wtime() - ts0);
+#endif
     }
 
 #if CACHE_EDGES
@@ -1048,12 +1243,17 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     std::vector<uint8_t>().swap(w_chunk);
 #endif
 
+#if ENABLE_PROFILE
+    double t_p1_sync0 = MPI_Wtime();
+#endif
     MPI_Win_sync(win);
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
 
 #if ENABLE_PROFILE
-    double t_pass1 = MPI_Wtime() - t1;
+    timers.t_p1_sync = MPI_Wtime() - t_p1_sync0;
+    timers.t_p1_total = MPI_Wtime() - t1;
+    double t_pass1 = timers.t_p1_total;
 #endif
 
 #if ENABLE_DEDUP_PROFILE
@@ -1234,7 +1434,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 #endif
 
 #if ENABLE_PROFILE
-    double t2 = MPI_Wtime();
+    double t_pref_0 = MPI_Wtime();
+    double t2 = t_pref_0;
+    double tagg0 = MPI_Wtime();
 #endif
 
     // Parallel Prefix Sum & Rank-Relative Offset calculation (Absolute Cursor)
@@ -1249,10 +1451,18 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         }
         local_adjacency_count += deg_v;
     }
+#if ENABLE_PROFILE
+    timers.t_pref_agg = MPI_Wtime() - tagg0;
+    double tscan0 = MPI_Wtime();
+#endif
 
     uint64_t rank_base = 0;
     MPI_Exscan(&local_adjacency_count, &rank_base, 1, MPI_UINT64_T, MPI_SUM, shm_comm);
     if (shm_rank == 0) rank_base = 0;
+#if ENABLE_PROFILE
+    timers.t_pref_scan = MPI_Wtime() - tscan0;
+    double tcur0 = MPI_Wtime();
+#endif
 
     uint64_t running_row = rank_base;
     for (uint64_t vert = v_begin; vert < v_end; vert++) {
@@ -1270,10 +1480,19 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     if (v_end == N) {
         row[N] = running_row;
     }
+#if ENABLE_PROFILE
+    timers.t_pref_cursor = MPI_Wtime() - tcur0;
+    double t_pref_s0 = MPI_Wtime();
+#endif
 
     MPI_Win_sync(win);
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
+
+#if ENABLE_PROFILE
+    timers.t_pref_sync = MPI_Wtime() - t_pref_s0;
+    timers.t_pref_total = MPI_Wtime() - t_pref_0;
+#endif
 
     if (shm_rank == 0) {
         if (row[0] != 0 || row[N] != 2 * M) {
@@ -1437,8 +1656,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 #endif
 
 #if ENABLE_PROFILE
-    double t_prefix = MPI_Wtime() - t2;
+    double t_prefix = timers.t_pref_total;
     double t3 = MPI_Wtime();
+    double t_p2_0 = t3;
 #endif
 
     // Pass 2: fill adj (lock-free) with Absolute Cursor
@@ -1461,6 +1681,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             uint64_t total_dir = chunk_len * 2;
             if (bucketed_edges.size() < total_dir) bucketed_edges.resize(total_dir);
 
+#if ENABLE_PROFILE
+            double tpc0 = MPI_Wtime();
+#endif
             std::fill(bcount.begin(), bcount.end(), 0);
             for (uint64_t k = 0; k < chunk_len; ++k) {
                 uint64_t packed = packed_edges[chunk_start + k];
@@ -1473,6 +1696,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             boffset[0] = 0;
             for (uint32_t b = 1; b < NUM_BUCKETS; ++b) boffset[b] = boffset[b - 1] + bcount[b - 1];
             std::memcpy(bcurr.data(), boffset.data(), NUM_BUCKETS * sizeof(uint32_t));
+#if ENABLE_PROFILE
+            timers.t_p2_count += (MPI_Wtime() - tpc0);
+            double tps0 = MPI_Wtime();
+#endif
 
             for (uint64_t k = 0; k < chunk_len; ++k) {
                 uint64_t packed = packed_edges[chunk_start + k];
@@ -1485,6 +1712,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                 bucketed_edges[bcurr[vk >> bucket_shift]++] = (static_cast<uint64_t>(vk) << 34) |
                                                               (static_cast<uint64_t>(uk) << 8) | wk;
             }
+#if ENABLE_PROFILE
+            timers.t_p2_scatter += (MPI_Wtime() - tps0);
+            double tpf0 = MPI_Wtime();
+#endif
 
             for (uint32_t b = 0; b < NUM_BUCKETS; ++b) {
                 uint32_t b_start = boffset[b];
@@ -1499,8 +1730,14 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                     adj[pu] = {v, w};
                 }
             }
+#if ENABLE_PROFILE
+            timers.t_p2_fill += (MPI_Wtime() - tpf0);
+#endif
         }
     } else {
+#if ENABLE_PROFILE
+        double tpf0 = MPI_Wtime();
+#endif
         for (uint64_t k = 0; k < local_M; k++) {
             uint64_t packed = packed_edges[k];
             uint32_t uk = static_cast<uint32_t>(packed >> 34);
@@ -1513,6 +1750,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             uint64_t pv = my_degree[vk]++;
             adj[pv] = {uk, wk};
         }
+#if ENABLE_PROFILE
+        timers.t_p2_fill = MPI_Wtime() - tpf0;
+#endif
     }
 #else
     for (uint64_t i = edge_begin; i < edge_end; ++i) {
@@ -1528,9 +1768,16 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     }
 #endif
 
+#if ENABLE_PROFILE
+    double t_p2_sync0 = MPI_Wtime();
+#endif
     MPI_Win_sync(win);
     MPI_Barrier(shm_comm);
     MPI_Win_sync(win);
+#if ENABLE_PROFILE
+    timers.t_p2_sync = MPI_Wtime() - t_p2_sync0;
+    timers.t_p2_total = MPI_Wtime() - t_p2_0;
+#endif
 
 #if CACHE_EDGES
     // Free packed_edges buffer before SSSP
@@ -1853,11 +2100,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 
 #endif
 
-#if ENABLE_PROFILE || PRINT_PASS2
-    double t_pass2 = MPI_Wtime() - t3;
-#endif
 #if PRINT_PASS2
-    if (world_rank == 0) std::printf("Pass 2 time: %.4f s\n", t_pass2);
+    double t_pass2_print = MPI_Wtime() - t3;
+    if (world_rank == 0) std::printf("Pass 2 time: %.4f s\n", t_pass2_print);
 #endif
 #if ENABLE_PROFILE
     double t4 = MPI_Wtime();
@@ -1905,6 +2150,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 #endif
 
             // Parallel compute summary statistics for this source
+#if ENABLE_PROFILE
+            double t_res_0 = MPI_Wtime();
+#endif
             int64_t local_reached = 0;
             uint64_t local_checksum = 0;
             uint64_t local_digest1 = 0;
@@ -1944,6 +2192,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             MPI_Win_sync(win);
             MPI_Barrier(team_comm);
             MPI_Win_sync(win);
+#if ENABLE_PROFILE
+            sssp_stats.result_time += (MPI_Wtime() - t_res_0);
+#endif
         }
 
         MPI_Comm_free(&team_comm);
@@ -1954,8 +2205,14 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
 
         for (size_t s = world_rank; s < S; s += world_size) {
             dial_queue.clear();
+#if ENABLE_PROFILE
+            double t_d0 = MPI_Wtime();
+#endif
             dial(row, adj, N, sources[s], dist, dial_queue);
-
+#if ENABLE_PROFILE
+            sssp_stats.relax_time += (MPI_Wtime() - t_d0);
+            double t_res_0 = MPI_Wtime();
+#endif
             FlatResultHeader hdr{};
             hdr.n_reached = 0;
             hdr.checksum = 0;
@@ -1977,6 +2234,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             for (int k = 0; k < p.nsample; k++) {
                 my_sample[k] = (dist[samples[k]] == INF) ? -1 : static_cast<int32_t>(dist[samples[k]]);
             }
+#if ENABLE_PROFILE
+            sssp_stats.result_time += (MPI_Wtime() - t_res_0);
+#endif
         }
     }
 
@@ -1985,7 +2245,11 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     MPI_Win_sync(win);
 
 #if ENABLE_PROFILE
-    double t_sssp = MPI_Wtime() - t4;
+    timers.t_sssp_total = MPI_Wtime() - t4;
+    timers.t_sssp_init = sssp_stats.init_time;
+    timers.t_sssp_relax = sssp_stats.relax_time;
+    timers.t_sssp_coll = sssp_stats.collective_time;
+    timers.t_sssp_result = sssp_stats.result_time;
     double t5 = MPI_Wtime();
 #endif
 
@@ -2005,29 +2269,294 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     }
 
 #if ENABLE_PROFILE
-    double t_copy = MPI_Wtime() - t5;
-    double times[6] = {t_alloc, t_pass1, t_prefix, t_pass2, t_sssp, t_copy};
-    double max_times[6] = {0};
-    MPI_Reduce(times, max_times, 6, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    timers.t_copy = MPI_Wtime() - t5;
+    MPI_Barrier(MPI_COMM_WORLD);
+    timers.t_run_total = MPI_Wtime() - t_run_start;
 
-    // Collect SSSP diagnostic stats
-    uint64_t max_rounds = 0;
-    double max_coll_time = 0;
-    double max_relax_time = 0;
-    uint64_t total_front = 0;
-    MPI_Reduce(&sssp_stats.rounds, &max_rounds, 1, MPI_UINT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&sssp_stats.collective_time, &max_coll_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&sssp_stats.relax_time, &max_relax_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&sssp_stats.total_frontier, &total_front, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+    // Collect RoundSummary from remote teams to rank 0
+    if (use_coop) {
+        if (world_rank != 0 && world_rank < team_count) {
+            uint64_t n_rounds = sssp_stats.round_summaries.size();
+            MPI_Send(&n_rounds, 1, MPI_UINT64_T, 0, 0x1234, MPI_COMM_WORLD);
+            if (n_rounds > 0) {
+                MPI_Send(sssp_stats.round_summaries.data(),
+                         n_rounds * sizeof(RoundSummary),
+                         MPI_BYTE, 0, 0x1235, MPI_COMM_WORLD);
+            }
+        } else if (world_rank == 0) {
+            for (int r = 1; r < team_count; ++r) {
+                uint64_t n_rounds = 0;
+                MPI_Recv(&n_rounds, 1, MPI_UINT64_T, r, 0x1234, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                if (n_rounds > 0) {
+                    std::vector<RoundSummary> r_data(n_rounds);
+                    MPI_Recv(r_data.data(),
+                             n_rounds * sizeof(RoundSummary),
+                             MPI_BYTE, r, 0x1235, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    sssp_stats.round_summaries.insert(
+                        sssp_stats.round_summaries.end(),
+                        r_data.begin(), r_data.end());
+                }
+            }
+        }
+    }
+
+    constexpr int NUM_TIMERS = 22;
+    static const char *TIMER_NAMES[NUM_TIMERS] = {
+        "1. Shared Alloc",
+        "2. Pass 1 Total",
+        "  - Edge Generation",
+        "  - Store Packed & Deg",
+        "  - Pass 1 Barrier/Sync",
+        "3. Prefix Sum Total",
+        "  - Degree Aggregation",
+        "  - Exscan (Row Base)",
+        "  - Absolute Cursor Calc",
+        "  - Prefix Barrier/Sync",
+        "4. Pass 2 Total",
+        "  - Radix Bucket Count",
+        "  - Radix Scatter",
+        "  - CSR Scatter Fill",
+        "  - Pass 2 Barrier/Sync",
+        "5. SSSP Total",
+        "  - Dist Init & Reset",
+        "  - Adjacency Scan & Relax",
+        "  - Collectives & Barrier",
+        "  - Result Aggregation",
+        "6. Shared Output Copy",
+        "Actual Run Total"
+    };
+
+    double local_arr[NUM_TIMERS];
+    timers.to_array(local_arr);
+
+    double max_arr[NUM_TIMERS] = {0};
+    double min_arr[NUM_TIMERS] = {0};
+    double sum_arr[NUM_TIMERS] = {0};
+
+    MPI_Reduce(local_arr, max_arr, NUM_TIMERS, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_arr, min_arr, NUM_TIMERS, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_arr, sum_arr, NUM_TIMERS, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        std::printf("[Profile] Alloc: %.4fs | Pass1: %.4fs | Prefix: %.4fs | Pass2: %.4fs | (Build: %.4fs) | SSSP: %.4fs | Copy: %.4fs\n",
-                    max_times[0], max_times[1], max_times[2], max_times[3],
-                    max_times[0] + max_times[1] + max_times[2] + max_times[3],
-                    max_times[4], max_times[5]);
-        if (use_coop) {
-            std::printf("[SSSP Stats] Rounds: %llu | Collectives: %.4fs | Relax: %.4fs | TotalFrontier: %llu\n",
-                        (unsigned long long)max_rounds, max_coll_time, max_relax_time, (unsigned long long)total_front);
+        double actual_max_total = max_arr[21];
+        double phase_max_sum = max_arr[0] + max_arr[1] + max_arr[5] + max_arr[10] + max_arr[15] + max_arr[20];
+        double build_max_total = max_arr[1] + max_arr[5] + max_arr[10];
+        double sssp_max_total = max_arr[15];
+        double build_pct = (actual_max_total > 1e-9) ? (build_max_total / actual_max_total * 100.0) : 0.0;
+        double sssp_pct = (actual_max_total > 1e-9) ? (sssp_max_total / actual_max_total * 100.0) : 0.0;
+
+        std::printf("\n========================================================================================\n");
+        std::printf("                     PHASE 0: 24-RANK ACCURATE PROFILE BREAKDOWN                       \n");
+        std::printf("========================================================================================\n");
+        std::printf("%-30s | %9s | %9s | %9s | %8s | %10s\n",
+                    "Phase Name", "Min (s)", "Max (s)", "Avg (s)", "Max/Avg", "% Actual Tot");
+        std::printf("-------------------------------+-----------+-----------+-----------+----------+-----------\n");
+        for (int i = 0; i < NUM_TIMERS - 1; ++i) {
+            double avg = sum_arr[i] / world_size;
+            double ratio = (avg > 1e-9) ? (max_arr[i] / avg) : 1.0;
+            double pct = (actual_max_total > 1e-9) ? (max_arr[i] / actual_max_total * 100.0) : 0.0;
+            std::printf("%-30s | %9.4f | %9.4f | %9.4f | %7.2fx | %9.2f%%\n",
+                        TIMER_NAMES[i], min_arr[i], max_arr[i], avg, ratio, pct);
+            if (i == 0 || i == 4 || i == 9 || i == 14 || i == 19 || i == 20) {
+                std::printf("-------------------------------+-----------+-----------+-----------+----------+-----------\n");
+            }
+        }
+        double avg_tot = sum_arr[21] / world_size;
+        double ratio_tot = (avg_tot > 1e-9) ? (actual_max_total / avg_tot) : 1.0;
+        std::printf("%-30s | %9.4f | %9.4f | %9.4f | %7.2fx | %9.2f%%\n",
+                    "ACTUAL RUN TOTAL", min_arr[21], actual_max_total, avg_tot, ratio_tot, 100.0);
+        std::printf("========================================================================================\n");
+        std::printf("Phase-Max Sum: %.4f s | Actual Max Total: %.4f s | Phase Sync Skew: %.4f s\n",
+                    phase_max_sum, actual_max_total, phase_max_sum - actual_max_total);
+        std::printf("Build Total (Pass1+Prefix+Pass2): %.4f s (%.2f%% of Actual Total)\n",
+                    build_max_total, build_pct);
+        std::printf("SSSP Total (Init+Relax+Coll+Res):  %.4f s (%.2f%% of Actual Total)\n",
+                    sssp_max_total, sssp_pct);
+        std::printf("========================================================================================\n\n");
+
+        // PHASE 1: Degree-Aware Work-Imbalance Profiler
+        if (!sssp_stats.round_summaries.empty()) {
+            auto &rounds = sssp_stats.round_summaries;
+            std::vector<double> edge_imb_vec;
+            std::vector<double> time_imb_vec;
+            std::vector<double> skew_vec;
+            uint64_t total_frontier_verts = 0;
+            uint64_t total_frontier_deg = 0;
+            uint64_t global_max_deg = 0;
+            uint32_t tot_hubs[4] = {0, 0, 0, 0};
+            uint64_t tot_hub_edges[4] = {0, 0, 0, 0};
+
+            for (const auto &r : rounds) {
+                if (r.frontier_size == 0) continue;
+                edge_imb_vec.push_back(r.edge_imbalance_ratio);
+                time_imb_vec.push_back(r.time_imbalance_ratio);
+                skew_vec.push_back(r.barrier_skew);
+                total_frontier_verts += r.frontier_size;
+                total_frontier_deg += r.total_degree;
+                if (r.max_degree > global_max_deg) global_max_deg = r.max_degree;
+                tot_hubs[0] += r.hubs_gt_1k;
+                tot_hubs[1] += r.hubs_gt_4k;
+                tot_hubs[2] += r.hubs_gt_16k;
+                tot_hubs[3] += r.hubs_gt_64k;
+                tot_hub_edges[0] += r.edges_gt_1k;
+                tot_hub_edges[1] += r.edges_gt_4k;
+                tot_hub_edges[2] += r.edges_gt_16k;
+                tot_hub_edges[3] += r.edges_gt_64k;
+            }
+
+            std::sort(edge_imb_vec.begin(), edge_imb_vec.end());
+            std::sort(time_imb_vec.begin(), time_imb_vec.end());
+            std::sort(skew_vec.begin(), skew_vec.end());
+
+            size_t valid_n = edge_imb_vec.size();
+            double med_edge_imb = valid_n ? edge_imb_vec[valid_n / 2] : 1.0;
+            double p95_edge_imb = valid_n ? edge_imb_vec[static_cast<size_t>(valid_n * 0.95)] : 1.0;
+            double max_edge_imb = valid_n ? edge_imb_vec.back() : 1.0;
+
+            double med_time_imb = valid_n ? time_imb_vec[valid_n / 2] : 1.0;
+            double p95_time_imb = valid_n ? time_imb_vec[static_cast<size_t>(valid_n * 0.95)] : 1.0;
+            double max_time_imb = valid_n ? time_imb_vec.back() : 1.0;
+
+            double med_skew_ms = valid_n ? skew_vec[valid_n / 2] * 1000.0 : 0.0;
+            double p95_skew_ms = valid_n ? skew_vec[static_cast<size_t>(valid_n * 0.95)] * 1000.0 : 0.0;
+            double max_skew_ms = valid_n ? skew_vec.back() * 1000.0 : 0.0;
+
+            std::printf("========================================================================================\n");
+            std::printf("             PHASE 1: DEGREE-AWARE WORK-IMBALANCE PROFILER REPORT                      \n");
+            std::printf("========================================================================================\n");
+            std::printf("[Global Frontier & Hub Distribution]\n");
+            std::printf("  Total Distance Rounds Analyzed: %zu\n", valid_n);
+            std::printf("  Total Frontier Vertices:        %llu\n", (unsigned long long)total_frontier_verts);
+            std::printf("  Total Frontier Degree (Edges):  %llu\n", (unsigned long long)total_frontier_deg);
+            std::printf("  Max Vertex Degree Seen:         %llu\n", (unsigned long long)global_max_deg);
+            double pct_deg = total_frontier_deg > 0 ? (100.0 / total_frontier_deg) : 0.0;
+            std::printf("  Hub Vertices (> 1K):  %-8u (Workload: %12llu edges, %6.2f%% of total)\n",
+                        tot_hubs[0], (unsigned long long)tot_hub_edges[0], tot_hub_edges[0] * pct_deg);
+            std::printf("  Hub Vertices (> 4K):  %-8u (Workload: %12llu edges, %6.2f%% of total)\n",
+                        tot_hubs[1], (unsigned long long)tot_hub_edges[1], tot_hub_edges[1] * pct_deg);
+            std::printf("  Hub Vertices (>16K):  %-8u (Workload: %12llu edges, %6.2f%% of total)\n",
+                        tot_hubs[2], (unsigned long long)tot_hub_edges[2], tot_hub_edges[2] * pct_deg);
+            std::printf("  Hub Vertices (>64K):  %-8u (Workload: %12llu edges, %6.2f%% of total)\n",
+                        tot_hubs[3], (unsigned long long)tot_hub_edges[3], tot_hub_edges[3] * pct_deg);
+            std::printf("\n[Work Imbalance & Skew Across Rounds]\n");
+            std::printf("  Edge Imbalance Ratio (Max/Avg): Median: %6.2fx | P95: %6.2fx | Max: %6.2fx\n",
+                        med_edge_imb, p95_edge_imb, max_edge_imb);
+            std::printf("  Time Imbalance Ratio (Max/Avg): Median: %6.2fx | P95: %6.2fx | Max: %6.2fx\n",
+                        med_time_imb, p95_time_imb, max_time_imb);
+            std::printf("  Barrier / Wait Skew:            Median: %6.2fms | P95: %6.2fms | Max: %6.2fms\n",
+                        med_skew_ms, p95_skew_ms, max_skew_ms);
+
+            // Heavy rounds analysis: filter rounds accounting for top 80% of total relaxation time
+            std::vector<RoundSummary> time_sorted_rounds = rounds;
+            std::sort(time_sorted_rounds.begin(), time_sorted_rounds.end(), [](const RoundSummary &a, const RoundSummary &b) {
+                return a.max_relax_time > b.max_relax_time;
+            });
+
+            double total_relax_wall = 0.0;
+            for (const auto &r : time_sorted_rounds) total_relax_wall += r.max_relax_time;
+
+            double accum_wall = 0.0;
+            std::vector<double> heavy_edge_imb;
+            std::vector<double> heavy_time_imb;
+            std::vector<double> heavy_skew;
+
+            for (const auto &r : time_sorted_rounds) {
+                if (r.frontier_size == 0) continue;
+                accum_wall += r.max_relax_time;
+                heavy_edge_imb.push_back(r.edge_imbalance_ratio);
+                heavy_time_imb.push_back(r.time_imbalance_ratio);
+                heavy_skew.push_back(r.barrier_skew);
+                if (accum_wall >= 0.80 * total_relax_wall) break;
+            }
+
+            std::sort(heavy_edge_imb.begin(), heavy_edge_imb.end());
+            std::sort(heavy_time_imb.begin(), heavy_time_imb.end());
+            std::sort(heavy_skew.begin(), heavy_skew.end());
+
+            size_t heavy_n = heavy_edge_imb.size();
+            double h_med_edge = heavy_n ? heavy_edge_imb[heavy_n / 2] : 1.0;
+            double h_p95_edge = heavy_n ? heavy_edge_imb[static_cast<size_t>(heavy_n * 0.95)] : 1.0;
+            double h_max_edge = heavy_n ? heavy_edge_imb.back() : 1.0;
+
+            double h_med_time = heavy_n ? heavy_time_imb[heavy_n / 2] : 1.0;
+            double h_p95_time = heavy_n ? heavy_time_imb[static_cast<size_t>(heavy_n * 0.95)] : 1.0;
+            double h_max_time = heavy_n ? heavy_time_imb.back() : 1.0;
+
+            double h_med_skew_ms = heavy_n ? heavy_skew[heavy_n / 2] * 1000.0 : 0.0;
+            double h_p95_skew_ms = heavy_n ? heavy_skew[static_cast<size_t>(heavy_n * 0.95)] * 1000.0 : 0.0;
+            double h_max_skew_ms = heavy_n ? heavy_skew.back() * 1000.0 : 0.0;
+
+            std::printf("\n[Heavy Rounds Work Imbalance (Top 80%% SSSP Relaxation Time, %zu Rounds)]\n", heavy_n);
+            std::printf("  Edge Imbalance Ratio (Max/Avg): Median: %6.2fx | P95: %6.2fx | Max: %6.2fx\n",
+                        h_med_edge, h_p95_edge, h_max_edge);
+            std::printf("  Time Imbalance Ratio (Max/Avg): Median: %6.2fx | P95: %6.2fx | Max: %6.2fx\n",
+                        h_med_time, h_p95_time, h_max_time);
+            std::printf("  Barrier / Wait Skew:            Median: %6.2fms | P95: %6.2fms | Max: %6.2fms\n",
+                        h_med_skew_ms, h_p95_skew_ms, h_max_skew_ms);
+
+            std::printf("\n[Top 20 Most Time-Consuming Rounds (Heavy SSSP Rounds)]\n");
+            std::printf("%-4s | %-4s | %-5s | %-10s | %-8s | %-10s | %-10s | %-9s | %-7s | %-9s | %-7s | %-8s\n",
+                        "Rank", "Src", "Dist", "Frontier", "MaxDeg", "TotDeg", "MaxRankE", "AvgRankE", "EdgeImb", "MaxT(ms)", "TimeImb", "Skew(ms)");
+            std::printf("-----+------+-------+------------+----------+------------+------------+-----------+---------+-----------+---------+---------\n");
+            size_t show_heavy = std::min<size_t>(20, time_sorted_rounds.size());
+            for (size_t i = 0; i < show_heavy; ++i) {
+                const auto &r = time_sorted_rounds[i];
+                std::printf("%-4zu | %-4u | %-5u | %-10llu | %-8llu | %-10llu | %-10llu | %-9.1f | %6.2fx  | %8.2f  | %6.2fx  | %7.2f\n",
+                            i + 1, r.src_idx, r.distance,
+                            (unsigned long long)r.frontier_size,
+                            (unsigned long long)r.max_degree,
+                            (unsigned long long)r.total_degree,
+                            (unsigned long long)r.max_scanned_edges,
+                            r.avg_scanned_edges,
+                            r.edge_imbalance_ratio,
+                            r.max_relax_time * 1000.0,
+                            r.time_imbalance_ratio,
+                            r.barrier_skew * 1000.0);
+            }
+
+            // Sort rounds by edge_imbalance_ratio descending
+            std::vector<RoundSummary> sorted_rounds = rounds;
+            std::sort(sorted_rounds.begin(), sorted_rounds.end(), [](const RoundSummary &a, const RoundSummary &b) {
+                return a.edge_imbalance_ratio > b.edge_imbalance_ratio;
+            });
+
+            std::printf("\n[Top 20 Most Imbalanced Rounds (by Edge Imbalance)]\n");
+            std::printf("%-4s | %-4s | %-5s | %-10s | %-8s | %-10s | %-10s | %-9s | %-7s | %-9s | %-7s | %-8s\n",
+                        "Rank", "Src", "Dist", "Frontier", "MaxDeg", "TotDeg", "MaxRankE", "AvgRankE", "EdgeImb", "MaxT(ms)", "TimeImb", "Skew(ms)");
+            std::printf("-----+------+-------+------------+----------+------------+------------+-----------+---------+-----------+---------+---------\n");
+            size_t show_count = std::min<size_t>(20, sorted_rounds.size());
+            for (size_t i = 0; i < show_count; ++i) {
+                const auto &r = sorted_rounds[i];
+                std::printf("%-4zu | %-4u | %-5u | %-10llu | %-8llu | %-10llu | %-10llu | %-9.1f | %6.2fx  | %8.2f  | %6.2fx  | %7.2f\n",
+                            i + 1, r.src_idx, r.distance,
+                            (unsigned long long)r.frontier_size,
+                            (unsigned long long)r.max_degree,
+                            (unsigned long long)r.total_degree,
+                            (unsigned long long)r.max_scanned_edges,
+                            r.avg_scanned_edges,
+                            r.edge_imbalance_ratio,
+                            r.max_relax_time * 1000.0,
+                            r.time_imbalance_ratio,
+                            r.barrier_skew * 1000.0);
+            }
+            std::printf("========================================================================================\n");
+
+            // Evaluate Criteria A & B
+            bool crit_a = (sssp_pct >= 40.0);
+            bool crit_b = (h_p95_edge >= 2.0 && h_max_skew_ms >= 5.0);
+            std::printf("[Phase 1 Continuation Criteria Evaluation]\n");
+            std::printf("  Criteria A (SSSP >= 40%% of Actual Total): %s (SSSP is %.2f%% of total)\n",
+                        crit_a ? "PASS" : "FAIL", sssp_pct);
+            std::printf("  Criteria B (Heavy Rounds P95 Edge Imbalance >= 2.0x & Skew >= 5ms): %s (P95 is %.2fx, Max Skew is %.2fms)\n",
+                        crit_b ? "PASS" : "FAIL", h_p95_edge, h_max_skew_ms);
+            if (crit_a && crit_b) {
+                std::printf("  Decision: Hub Splitting is JUSTIFIED and RECOMMENDED for next phase.\n");
+            } else if (!crit_a) {
+                std::printf("  Decision: SSSP does NOT dominate run time. Graph Build dominates (%.2f%%). Next phase must optimize Build.\n", build_pct);
+            } else {
+                std::printf("  Decision: Edge imbalance in heavy rounds is mild (P95=%.2fx). Fine-grained chunking or other SSSP/Build optimizations recommended.\n", h_p95_edge);
+            }
+            std::printf("========================================================================================\n\n");
         }
     }
 #endif
